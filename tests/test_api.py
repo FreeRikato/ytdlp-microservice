@@ -76,6 +76,23 @@ class TestSubtitlesEndpointSuccess:
         data = response.json()
         assert data["language"] == "en"
 
+    def test_get_subtitles_text_format(self, client, mock_successful_extraction):
+        """Test fetching subtitles in TEXT format (combined text)."""
+        response = client.get(
+            "/api/v1/subtitles?video_url=https://youtu.be/dQw4w9WgXcQ&lang=en&format=text"
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+
+        assert data["video_id"] == "dQw4w9WgXcQ"
+        assert data["language"] == "en"
+        assert "text" in data
+        assert "start" not in data  # No timestamps
+        assert "subtitles" not in data  # No subtitle list
+        # Check text is combined (mock returns 2 entries: "Hello world" and "This is a test subtitle")
+        assert data["text"] == "Hello world This is a test subtitle"
+
 
 class TestSubtitlesEndpointErrors:
     """Tests for error handling in subtitle retrieval."""
