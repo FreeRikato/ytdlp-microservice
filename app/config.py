@@ -79,6 +79,11 @@ class Settings(BaseSettings):
     cache_maxsize: int = 1000  # Maximum number of cached entries
     redis_url: str | None = None  # Optional Redis backend for future use
 
+    # ========== Database Settings ==========
+
+    # SQLite database file path (relative to app directory or absolute)
+    database_path: str = "database.db"
+
     model_config = SettingsConfigDict(
         env_prefix="YTDLP_",
         env_file=".env",
