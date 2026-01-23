@@ -64,6 +64,9 @@ class SubtitleExtractor:
         r"(\d{2}:\d{2}\.\d{3})\s*-->\s*(\d{2}:\d{2}\.\d{3})"
     )
 
+    # Pattern to remove all HTML/XML-style tags from subtitle text
+    TAG_REMOVAL_PATTERN = re.compile(r"<[^>]*>")
+
     def __init__(self, config: Settings | None = None):
         """
         Initialize the extractor with configuration.
@@ -177,8 +180,8 @@ class SubtitleExtractor:
             i += 1
             while i < len(lines) and lines[i].strip():
                 text_line = lines[i].strip()
-                # Remove VTT timestamp tags if present
-                text_line = re.sub(r"<\d{2}:\d{2}:\d{2}\.\d{3}>", "", text_line)
+                # Remove all HTML/XML-style tags
+                text_line = self.TAG_REMOVAL_PATTERN.sub("", text_line)
                 if text_line and text_line not in ("NOTE", "STYLE"):
                     text_lines.append(text_line)
                 i += 1
@@ -251,7 +254,9 @@ class SubtitleExtractor:
 
                 # Return based on requested format
                 if output_format == "vtt":
-                    return video_id, vtt_content
+                    # Clean all HTML/XML-style tags from VTT content
+                    cleaned_vtt = self.TAG_REMOVAL_PATTERN.sub("", vtt_content)
+                    return video_id, cleaned_vtt
                 else:
                     # Parse VTT to structured JSON
                     entries = self._parse_vtt_to_json(vtt_content)
