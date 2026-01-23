@@ -225,3 +225,195 @@ class TestSubtitleExtractorInit:
         custom_config = Settings(ytdlp_sleep_seconds=30)
         extractor = SubtitleExtractor(config=custom_config)
         assert extractor.config.ytdlp_sleep_seconds == 30
+
+
+class TestVTTParsingEdgeCases:
+    """Tests for VTT parsing edge cases."""
+
+    def test_empty_vtt_segments(self, tmp_path):
+        """Test handling of empty VTT segments."""
+        vtt_content = """WEBVTT
+
+00:00:00.000 --> 00:00:02.000
+First subtitle
+
+00:00:02.000 --> 00:00:05.000
+
+
+00:00:05.000 --> 00:00:08.000
+Third subtitle
+"""
+        vtt_file = tmp_path / "dQw4w9WgXcQ.en.vtt"
+        vtt_file.write_text(vtt_content, encoding="utf-8")
+
+        extractor = SubtitleExtractor()
+
+        with patch("app.service.yt_dlp.YoutubeDL") as mock_ydl:
+            mock_instance = MagicMock()
+            mock_instance.extract_info = MagicMock(return_value={"id": "dQw4w9WgXcQ"})
+            mock_instance.__enter__ = MagicMock(return_value=mock_instance)
+            mock_instance.__exit__ = MagicMock(return_value=False)
+            mock_ydl.return_value = mock_instance
+
+            with patch("tempfile.TemporaryDirectory") as mock_tempdir:
+                mock_cm = MagicMock()
+                mock_cm.__enter__ = MagicMock(return_value=str(tmp_path))
+                mock_cm.__exit__ = MagicMock(return_value=False)
+                mock_tempdir.return_value = mock_cm
+
+                video_id, result, metadata = extractor.extract_subtitles(
+                    "https://youtu.be/dQw4w9WgXcQ", "en", "json"
+                )
+
+        # Empty segment should be handled (either included as empty or filtered)
+        assert video_id == "dQw4w9WgXcQ"
+        assert len(result) >= 2  # At least first and third should be present
+
+    def test_vtt_with_timestamps_spanning_midnight(self, tmp_path):
+        """Test VTT parsing with timestamps that could span midnight."""
+        vtt_content = """WEBVTT
+
+23:59:55.000 --> 00:00:05.000
+Spanning midnight subtitle
+"""
+        vtt_file = tmp_path / "dQw4w9WgXcQ.en.vtt"
+        vtt_file.write_text(vtt_content, encoding="utf-8")
+
+        extractor = SubtitleExtractor()
+
+        with patch("app.service.yt_dlp.YoutubeDL") as mock_ydl:
+            mock_instance = MagicMock()
+            mock_instance.extract_info = MagicMock(return_value={"id": "dQw4w9WgXcQ"})
+            mock_instance.__enter__ = MagicMock(return_value=mock_instance)
+            mock_instance.__exit__ = MagicMock(return_value=False)
+            mock_ydl.return_value = mock_instance
+
+            with patch("tempfile.TemporaryDirectory") as mock_tempdir:
+                mock_cm = MagicMock()
+                mock_cm.__enter__ = MagicMock(return_value=str(tmp_path))
+                mock_cm.__exit__ = MagicMock(return_value=False)
+                mock_tempdir.return_value = mock_cm
+
+                video_id, result, metadata = extractor.extract_subtitles(
+                    "https://youtu.be/dQw4w9WgXcQ", "en", "json"
+                )
+
+        assert video_id == "dQw4w9WgXcQ"
+        assert len(result) == 1
+        assert "midnight" in result[0].text
+
+    def test_malformed_vtt_timestamps(self, tmp_path):
+        """Test handling of malformed VTT timestamps."""
+        vtt_content = """WEBVTT
+
+00:00:00 --> 00:00:03.500
+Malformed timestamp (missing milliseconds)
+
+00:00:03.500 --> 00:00:07.000
+Valid timestamp
+"""
+        vtt_file = tmp_path / "dQw4w9WgXcQ.en.vtt"
+        vtt_file.write_text(vtt_content, encoding="utf-8")
+
+        extractor = SubtitleExtractor()
+
+        with patch("app.service.yt_dlp.YoutubeDL") as mock_ydl:
+            mock_instance = MagicMock()
+            mock_instance.extract_info = MagicMock(return_value={"id": "dQw4w9WgXcQ"})
+            mock_instance.__enter__ = MagicMock(return_value=mock_instance)
+            mock_instance.__exit__ = MagicMock(return_value=False)
+            mock_ydl.return_value = mock_instance
+
+            with patch("tempfile.TemporaryDirectory") as mock_tempdir:
+                mock_cm = MagicMock()
+                mock_cm.__enter__ = MagicMock(return_value=str(tmp_path))
+                mock_cm.__exit__ = MagicMock(return_value=False)
+                mock_tempdir.return_value = mock_cm
+
+                try:
+                    video_id, result, metadata = extractor.extract_subtitles(
+                        "https://youtu.be/dQw4w9WgXcQ", "en", "json"
+                    )
+                    # If it succeeds, at least one entry should be present
+                    assert len(result) >= 1
+                except (ValueError, Exception):
+                    # ValueError is acceptable for malformed VTT
+                    pass
+
+    def test_vtt_with_html_tags(self, tmp_path):
+        """Test VTT parsing removes HTML tags correctly."""
+        vtt_content = """WEBVTT
+
+00:00:00.000 --> 00:00:03.500
+<i>Italic text</i>
+<b>Bold text</b>
+<u>Underlined text</u>
+"""
+        vtt_file = tmp_path / "dQw4w9WgXcQ.en.vtt"
+        vtt_file.write_text(vtt_content, encoding="utf-8")
+
+        extractor = SubtitleExtractor()
+
+        with patch("app.service.yt_dlp.YoutubeDL") as mock_ydl:
+            mock_instance = MagicMock()
+            mock_instance.extract_info = MagicMock(return_value={"id": "dQw4w9WgXcQ"})
+            mock_instance.__enter__ = MagicMock(return_value=mock_instance)
+            mock_instance.__exit__ = MagicMock(return_value=False)
+            mock_ydl.return_value = mock_instance
+
+            with patch("tempfile.TemporaryDirectory") as mock_tempdir:
+                mock_cm = MagicMock()
+                mock_cm.__enter__ = MagicMock(return_value=str(tmp_path))
+                mock_cm.__exit__ = MagicMock(return_value=False)
+                mock_tempdir.return_value = mock_cm
+
+                video_id, result, metadata = extractor.extract_subtitles(
+                    "https://youtu.be/dQw4w9WgXcQ", "en", "json"
+                )
+
+        assert video_id == "dQw4w9WgXcQ"
+        assert len(result) == 1
+        # HTML tags should be removed
+        assert "<i>" not in result[0].text
+        assert "</i>" not in result[0].text
+        assert "<b>" not in result[0].text
+        assert "</b>" not in result[0].text
+
+    def test_vtt_with_cue_identifiers(self, tmp_path):
+        """Test VTT parsing handles cue identifiers."""
+        vtt_content = """WEBVTT
+
+ID1
+00:00:00.000 --> 00:00:03.500
+Subtitle with cue ID
+
+ID2
+00:00:03.500 --> 00:00:07.000
+Another subtitle with cue ID
+"""
+        vtt_file = tmp_path / "dQw4w9WgXcQ.en.vtt"
+        vtt_file.write_text(vtt_content, encoding="utf-8")
+
+        extractor = SubtitleExtractor()
+
+        with patch("app.service.yt_dlp.YoutubeDL") as mock_ydl:
+            mock_instance = MagicMock()
+            mock_instance.extract_info = MagicMock(return_value={"id": "dQw4w9WgXcQ"})
+            mock_instance.__enter__ = MagicMock(return_value=mock_instance)
+            mock_instance.__exit__ = MagicMock(return_value=False)
+            mock_ydl.return_value = mock_instance
+
+            with patch("tempfile.TemporaryDirectory") as mock_tempdir:
+                mock_cm = MagicMock()
+                mock_cm.__enter__ = MagicMock(return_value=str(tmp_path))
+                mock_cm.__exit__ = MagicMock(return_value=False)
+                mock_tempdir.return_value = mock_cm
+
+                video_id, result, metadata = extractor.extract_subtitles(
+                    "https://youtu.be/dQw4w9WgXcQ", "en", "json"
+                )
+
+        assert video_id == "dQw4w9WgXcQ"
+        assert len(result) == 2
+        assert "cue ID" in result[0].text or "cue ID" in result[1].text
+

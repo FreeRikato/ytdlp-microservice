@@ -17,7 +17,6 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     - X-Content-Type-Options: nosniff - Prevents MIME type sniffing
     - X-Frame-Options: DENY - Prevents clickjacking attacks
     - Content-Security-Policy: default-src 'self' - Restricts resource sources
-    - X-XSS-Protection: 1; mode=block - Enables XSS filtering
     - Strict-Transport-Security (HTTPS only) - Enforces HTTPS connections
 
     The middleware checks the request scheme and only adds HSTS header
@@ -43,11 +42,11 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         # Prevent clickjacking - deny all framing
         response.headers["X-Frame-Options"] = "DENY"
 
-        # Content Security Policy - only allow resources from same origin
-        response.headers["Content-Security-Policy"] = "default-src 'self'"
-
-        # XSS protection (legacy but still useful for older browsers)
-        response.headers["X-XSS-Protection"] = "1; mode=block"
+        # Content Security Policy - allow scripts for Swagger UI paths
+        if request.url.path.startswith(("/docs", "/redoc", "/openapi")):
+            response.headers["Content-Security-Policy"] = "default-src 'self' 'unsafe-inline'"
+        else:
+            response.headers["Content-Security-Policy"] = "default-src 'self'"
 
         # HSTS only if using HTTPS (avoid browser warnings on HTTP)
         if request.url.scheme == "https":

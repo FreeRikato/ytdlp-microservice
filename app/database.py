@@ -263,6 +263,23 @@ class DatabaseEngine:
             await session.refresh(entry)
             return entry
 
+    async def health_check(self) -> dict[str, str]:
+        """
+        Check database health.
+
+        Returns:
+            Dictionary with status and message
+        """
+        try:
+            async with self.session_factory() as session:
+                # Execute a simple query to check connectivity
+                from sqlmodel import text
+                await session.execute(text("SELECT 1"))
+            return {"status": "healthy", "database": "connected"}
+        except Exception as e:
+            logger.error(f"Database health check failed: {e}")
+            return {"status": "unhealthy", "database": str(e)}
+
 
 # Global database engine instance
 db_engine = DatabaseEngine()

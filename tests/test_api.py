@@ -236,3 +236,144 @@ class TestHealthEndpoints:
         assert response.status_code == 200
         data = response.json()
         assert data["status"] == "healthy"
+
+
+class TestBatchEndpointErrors:
+    """Tests for batch endpoint error handling."""
+
+    def test_batch_with_invalid_url(self, client):
+        """Test batch endpoint handles invalid URL gracefully."""
+        response = client.post(
+            "/api/v1/subtitles/batch",
+            json={
+                "videos": [
+                    {"video_url": "https://invalid.com/video", "lang": "en", "format": "json"}
+                ]
+            },
+        )
+
+        assert response.status_code == 200  # Batch returns partial results
+        data = response.json()
+        assert len(data) == 1
+        assert data[0]["success"] is False
+        assert "Invalid YouTube URL" in data[0]["error"]
+
+    def test_batch_with_mixed_results(self, client, mock_successful_extraction):
+        """Test batch endpoint returns mixed success/failure results."""
+        with patch("app.service.yt_dlp.YoutubeDL") as mock_ydl:
+            mock_instance = MagicMock()
+            mock_instance.extract_info = MagicMock(return_value={"id": "dQw4w9WgXcQ"})
+            mock_instance.__enter__ = MagicMock(return_value=mock_instance)
+            mock_instance.__exit__ = MagicMock(return_value=False)
+            mock_ydl.return_value = mock_instance
+
+            # Mock VTT file
+            import tempfile
+            import os
+            vtt_content = """WEBVTT
+
+00:00:00.000 --> 00:00:03.500
+Hello world
+"""
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.vtt', delete=False) as f:
+                f.write(vtt_content)
+                vtt_path = f.name
+
+            with patch("tempfile.TemporaryDirectory") as mock_tempdir:
+                mock_cm = MagicMock()
+                mock_cm.__enter__ = MagicMock(return_value=os.path.dirname(vtt_path))
+                mock_cm.__exit__ = MagicMock(return_value=False)
+                mock_tempdir.return_value = mock_cm
+
+                response = client.post(
+                    "/api/v1/subtitles/batch",
+                    json={
+                        "videos": [
+                            {"video_url": "https://invalid.com/video", "lang": "en", "format": "json"},
+                            {"video_url": "https://youtu.be/dQw4w9WgXcQ", "lang": "en", "format": "json"},
+                        ]
+                    },
+                )
+
+            os.unlink(vtt_path)
+
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data) == 2
+        # First video should fail (invalid URL)
+        assert data[0]["success"] is False
+        # Second video should succeed
+        assert data[1]["success"] is True
+
+    def test_batch_with_rate_limit_error(self, client):
+        """Test batch endpoint handles rate limit errors gracefully."""
+        import yt_dlp
+
+        with patch("app.service.yt_dlp.YoutubeDL") as mock_ydl:
+            mock_instance = MagicMock()
+            mock_instance.extract_info = MagicMock(
+                side_effect=yt_dlp.utils.DownloadError("HTTP Error 429: Too Many Requests")
+            )
+            mock_instance.__enter__ = MagicMock(return_value=mock_instance)
+            mock_instance.__exit__ = MagicMock(return_value=False)
+            mock_ydl.return_value = mock_instance
+
+            response = client.post(
+                "/api/v1/subtitles/batch",
+                json={
+                    "videos": [
+                        {"video_url": "https://youtu.be/dQw4w9WgXcQ", "lang": "en", "format": "json"}
+                    ]
+                },
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data) == 1
+        assert data[0]["success"] is False
+        # Error message should be present
+        assert data[0]["error"] is not None
+
+    def test_batch_with_download_error(self, client):
+        """Test batch endpoint handles download errors gracefully."""
+        import yt_dlp
+
+        with patch("app.service.yt_dlp.YoutubeDL") as mock_ydl:
+            mock_instance = MagicMock()
+            mock_instance.extract_info = MagicMock(
+                side_effect=yt_dlp.utils.DownloadError("Video unavailable")
+            )
+            mock_instance.__enter__ = MagicMock(return_value=mock_instance)
+            mock_instance.__exit__ = MagicMock(return_value=False)
+            mock_ydl.return_value = mock_instance
+
+            response = client.post(
+                "/api/v1/subtitles/batch",
+                json={
+                    "videos": [
+                        {"video_url": "https://youtu.be/dQw4w9WgXcQ", "lang": "en", "format": "json"}
+                    ]
+                },
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data) == 1
+        assert data[0]["success"] is False
+
+    def test_batch_max_videos_enforced(self, client):
+        """Test that batch endpoint enforces max videos limit."""
+        # Create 11 videos (exceeds max of 10)
+        videos = [
+            {"video_url": f"https://youtu.be/aaa{i}bbb{i}", "lang": "en", "format": "json"}
+            for i in range(11)
+        ]
+
+        response = client.post(
+            "/api/v1/subtitles/batch",
+            json={"videos": videos},
+        )
+
+        # Should return validation error (400 for list validation, 422 for pydantic)
+        assert response.status_code in [400, 422]
+
