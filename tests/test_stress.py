@@ -149,7 +149,7 @@ def stress_test_rate_limit(
     }
 
     print(f"{'=' * 60}")
-    print(f"YouTube Subtitle Rate Limit Stress Test")
+    print("YouTube Subtitle Rate Limit Stress Test")
     print(f"{'=' * 60}")
     print(f"Video: {video_url}")
     print(f"Max requests: {max_requests}")
@@ -199,7 +199,7 @@ def stress_test_rate_limit(
         # If we've hit multiple 429s in a row, stop
         if results["rate_limited"] >= 3:
             print(f"\n{'=' * 60}")
-            print(f"Multiple 429s detected. Stopping test.")
+            print("Multiple 429s detected. Stopping test.")
             print(f"{'=' * 60}\n")
             break
 
@@ -215,7 +215,7 @@ def print_summary(results: dict, max_requests: int):
     total = results["success"] + results["failures"] + results["rate_limited"] + results["other_errors"]
 
     print(f"\n{'=' * 60}")
-    print(f"SUMMARY")
+    print("SUMMARY")
     print(f"{'=' * 60}")
     print(f"Total requests made: {total}/{max_requests}")
     print(f"Successful:          {results['success']} ({100*results['success']/total:.1f}%)")
@@ -227,19 +227,19 @@ def print_summary(results: dict, max_requests: int):
         print(f"\n🚫 First 429 error at request: #{results['first_429_at']}")
         print(f"   Safe requests before rate limit: {results['first_429_at'] - 1}")
     else:
-        print(f"\n✅ No rate limiting detected!")
+        print("\n✅ No rate limiting detected!")
 
     if results["latencies"]:
         avg_latency = sum(results["latencies"]) / len(results["latencies"])
         min_latency = min(results["latencies"])
         max_latency = max(results["latencies"])
-        print(f"\nLatency stats:")
+        print("\nLatency stats:")
         print(f"   Average: {avg_latency:.2f}s")
         print(f"   Min:     {min_latency:.2f}s")
         print(f"   Max:     {max_latency:.2f}s")
 
     if results["error_messages"]:
-        print(f"\nSample error messages:")
+        print("\nSample error messages:")
         for msg in results["error_messages"][:5]:
             print(f"   - {msg[:100]}")
 
