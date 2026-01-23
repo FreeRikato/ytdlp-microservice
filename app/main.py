@@ -261,7 +261,7 @@ def configure_middleware():
     # Add CORS middleware first (runs first in chain)
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
+        allow_origins=["chrome-extension://lbaapiiaojechkkibeccnbfdifjadgdn"],
         allow_methods=["*"],
         allow_headers=["*"],
     )
