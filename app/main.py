@@ -6,6 +6,7 @@ YouTube videos with anti-bot detection strategies.
 """
 
 import logging
+import re
 from contextlib import asynccontextmanager
 from enum import Enum
 from typing import cast
@@ -101,6 +102,24 @@ class SubtitleResponse(BaseModel):
     }
 
 
+class SubtitleTextResponse(BaseModel):
+    """Response model for subtitle data in TEXT format (combined text only)."""
+
+    video_id: str = Field(..., description="YouTube video ID (11 characters)")
+    language: str = Field(..., description="Language code of the subtitles")
+    text: str = Field(..., description="Combined subtitle text content")
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "video_id": "dQw4w9WgXcQ",
+                "language": "en",
+                "text": "Hello world This is a test",
+            }
+        }
+    }
+
+
 class ErrorResponse(BaseModel):
     """Error response model."""
 
@@ -114,6 +133,7 @@ class OutputFormat(str, Enum):
 
     json = "json"
     vtt = "vtt"
+    text = "text"
 
 
 # ============================================================================
@@ -183,7 +203,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 
 @app.get(
     "/api/v1/subtitles",
-    response_model=SubtitleResponse,
+    response_model=None,
     responses={
         200: {"description": "Subtitles extracted successfully"},
         400: {"model": ErrorResponse, "description": "Invalid URL or parameters"},
@@ -196,8 +216,8 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 async def get_subtitles(
     video_url: str = Query(..., description="YouTube video URL (e.g., https://www.youtube.com/watch?v=xxx)"),
     lang: str = Query("en", description="Language code for subtitles (e.g., en, es, fr)"),
-    format: OutputFormat = Query(OutputFormat.json, description="Output format: json or vtt"),
-) -> SubtitleResponse | PlainTextResponse:
+    format: OutputFormat = Query(OutputFormat.json, description="Output format: json, vtt, or text"),
+) -> SubtitleResponse | SubtitleTextResponse | PlainTextResponse:
     """
     Extract subtitles from a YouTube video.
 
@@ -207,7 +227,7 @@ async def get_subtitles(
     **Parameters:**
     - **video_url**: Full YouTube URL or video ID
     - **lang**: Language code (default: "en")
-    - **format**: Response format - "json" for structured data, "vtt" for raw WebVTT
+    - **format**: Response format - "json" for structured data with timestamps, "vtt" for raw WebVTT, "text" for combined text only
 
     **Anti-Blocking Strategies:**
     1. Browser impersonation (TLS fingerprint spoofing)
@@ -222,6 +242,9 @@ async def get_subtitles(
 
     # VTT format
     curl "http://localhost:8000/api/v1/subtitles?video_url=https://www.youtube.com/watch?v=dQw4w9WgXcQ&lang=en&format=vtt"
+
+    # TEXT format (combined text, no timestamps)
+    curl "http://localhost:8000/api/v1/subtitles?video_url=https://www.youtube.com/watch?v=dQw4w9WgXcQ&lang=en&format=text"
     ```
 
     **Response Codes:**
@@ -260,8 +283,18 @@ async def get_subtitles(
                     "X-Video-ID": video_id,
                 },
             )
+        elif format == OutputFormat.text:
+            # Combine all subtitle text into single string
+            combined_text = " ".join(entry.text for entry in cast(list[SubtitleEntry], subtitle_data))
+            # Normalize whitespace
+            combined_text = re.sub(r"\s+", " ", combined_text).strip()
+            return SubtitleTextResponse(
+                video_id=video_id,
+                language=lang,
+                text=combined_text,
+            )
         else:
-            # Convert SubtitleEntry objects to Pydantic models
+            # Convert SubtitleEntry objects to Pydantic models (json format with timestamps)
             subtitle_models = [
                 SubtitleEntryModel(start=entry.start, end=entry.end, text=entry.text)
                 for entry in cast(list[SubtitleEntry], subtitle_data)
