@@ -8,3 +8,13 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Subtitle temporary files
+*.vtt
+*.srt
+temp/
+.subs/
+
+# Environment files
+.env
+.env.local
