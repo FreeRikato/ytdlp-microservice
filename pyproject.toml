@@ -1,7 +1,22 @@
 [project]
 name = "ytdlp-microservice"
 version = "0.1.0"
-description = "Add your description here"
+description = "FastAPI microservice for extracting YouTube subtitles with anti-bot detection"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "yt-dlp[default,curl-cffi]>=2024.12.6",
+    "pydantic>=2.10.0",
+    "pydantic-settings>=2.6.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0.0",
+    "pytest-cov>=5.0.0",
+    "pytest-asyncio>=0.24.0",
+    "pytest-mock>=3.14.0",
+    "httpx>=0.28.0",
+]
