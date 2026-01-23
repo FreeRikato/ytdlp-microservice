@@ -7,7 +7,6 @@ rate limits and ensure fast, reliable test execution.
 
 from unittest.mock import MagicMock, patch
 
-import pytest
 import yt_dlp
 
 
@@ -135,7 +134,6 @@ class TestSubtitlesEndpointErrors:
 
             # Mock TemporaryDirectory with no VTT files
             with patch("tempfile.TemporaryDirectory") as mock_tempdir:
-                from pathlib import Path
                 import tempfile
 
                 empty_dir = tempfile.mkdtemp()

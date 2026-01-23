@@ -4,7 +4,6 @@ Tests for utility functions in app/utils.py.
 This module tests URL validation and video ID extraction functions.
 """
 
-import pytest
 
 from app.utils import extract_video_id, is_valid_youtube_url
 

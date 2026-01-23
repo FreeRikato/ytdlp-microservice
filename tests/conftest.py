@@ -1,7 +1,6 @@
 """Minimal pytest fixtures for subtitle fetching tests."""
 
-from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import yt_dlp
@@ -16,7 +15,10 @@ def client():
     # Mock rate limiting to always allow during tests
     with patch("app.main._check_rate_limit", return_value=True):
         with patch("app.cache.cache.get", return_value=None):  # Disable cache for tests
-            yield TestClient(app)
+            # Mock database calls to avoid initialization issues
+            with patch("app.main.db_engine.get_cached_subtitle", new_callable=AsyncMock, return_value=None):
+                with patch("app.main.db_engine.set_cached_subtitle", new_callable=AsyncMock, return_value=None):
+                    yield TestClient(app)
 
 
 @pytest.fixture

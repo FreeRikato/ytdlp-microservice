@@ -18,11 +18,11 @@ Anti-Blocking Strategies (in order of priority):
 import logging
 import re
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-import bleach
+import nh3
 import yt_dlp
 from yt_dlp.networking.impersonate import ImpersonateTarget
 
@@ -46,6 +46,93 @@ class SubtitleEntry:
     start: str
     end: str
     text: str
+
+
+@dataclass
+class VideoMetadata:
+    """
+    Video metadata extracted from YouTube.
+
+    Attributes:
+        video_id: YouTube video ID (11 characters)
+        title: Video title
+        description: Video description (truncated if too long)
+        duration: Video duration in seconds
+        duration_formatted: Human-readable duration (HH:MM:SS)
+        thumbnail: URL to video thumbnail
+        channel: Channel name
+        channel_id: Channel ID
+        upload_date: Upload date (YYYYMMDD)
+        view_count: Number of views (if available)
+        like_count: Number of likes (if available)
+        tags: List of video tags
+        categories: List of categories
+        webpage_url: Full video URL
+        extractor: Source extractor (e.g., youtube)
+    """
+
+    video_id: str
+    title: str
+    description: str | None = None
+    duration: int | None = None
+    duration_formatted: str | None = None
+    thumbnail: str | None = None
+    channel: str | None = None
+    channel_id: str | None = None
+    upload_date: str | None = None
+    view_count: int | None = None
+    like_count: int | None = None
+    tags: list[str] = field(default_factory=list)
+    categories: list[str] = field(default_factory=list)
+    webpage_url: str | None = None
+    extractor: str = "youtube"
+
+    @classmethod
+    def from_info(cls, info: dict[str, Any]) -> "VideoMetadata":
+        """Create VideoMetadata from yt-dlp info dictionary."""
+        # Format duration
+        duration = info.get("duration")
+        duration_formatted = None
+        if duration:
+            hours, remainder = divmod(duration, 3600)
+            minutes, seconds = divmod(remainder, 60)
+            if hours > 0:
+                duration_formatted = f"{int(hours):02d}:{int(minutes):02d}:{int(seconds):02d}"
+            else:
+                duration_formatted = f"{int(minutes):02d}:{int(seconds):02d}"
+
+        # Truncate description if too long
+        description = info.get("description")
+        if description and len(description) > 5000:
+            description = description[:5000] + "..."
+
+        # Convert tags if present
+        tags = info.get("tags", [])
+        if tags and not isinstance(tags, list):
+            tags = list(tags) if tags else []
+
+        # Convert categories if present
+        categories = info.get("categories", [])
+        if categories and not isinstance(categories, list):
+            categories = list(categories) if categories else []
+
+        return cls(
+            video_id=info.get("id", ""),
+            title=info.get("title", ""),
+            description=description,
+            duration=duration,
+            duration_formatted=duration_formatted,
+            thumbnail=info.get("thumbnail"),
+            channel=info.get("uploader") or info.get("channel"),
+            channel_id=info.get("channel_id"),
+            upload_date=info.get("upload_date"),
+            view_count=info.get("view_count"),
+            like_count=info.get("like_count"),
+            tags=tags,
+            categories=categories,
+            webpage_url=info.get("webpage_url"),
+            extractor=info.get("extractor", "youtube"),
+        )
 
 
 class SubtitleExtractor:
@@ -186,7 +273,7 @@ class SubtitleExtractor:
                 # First remove angle brackets (for things like <00:00:02.500> timestamps)
                 text_line = self.TAG_REMOVAL_PATTERN.sub("", text_line)
                 # Then use bleach to sanitize any remaining HTML for security
-                text_line = bleach.clean(text_line, tags=[], strip=True)
+                text_line = nh3.clean(text_line)
                 if text_line and text_line not in ("NOTE", "STYLE"):
                     text_lines.append(text_line)
                 i += 1
@@ -201,7 +288,7 @@ class SubtitleExtractor:
 
     def extract_subtitles(
         self, video_url: str, lang: str = "en", output_format: str = "json"
-    ) -> tuple[str, list[SubtitleEntry] | str]:
+    ) -> tuple[str, list[SubtitleEntry] | str, VideoMetadata]:
         """
         Extract subtitles from a YouTube video.
 
@@ -211,9 +298,9 @@ class SubtitleExtractor:
             output_format: Either "json" or "vtt"
 
         Returns:
-            Tuple of (video_id, subtitles_data)
-            - For JSON: (video_id, list[SubtitleEntry])
-            - For VTT: (video_id, raw_vtt_string)
+            Tuple of (video_id, subtitles_data, metadata)
+            - For JSON: (video_id, list[SubtitleEntry], VideoMetadata)
+            - For VTT: (video_id, raw_vtt_string, VideoMetadata)
 
         Raises:
             yt_dlp.utils.DownloadError: If extraction fails
@@ -236,7 +323,10 @@ class SubtitleExtractor:
             with yt_dlp.YoutubeDL(options) as ydl:
                 # Run the extraction - this downloads the VTT file to temp_dir
                 logger.info(f"Starting yt-dlp extraction with impersonate={self.config.ytdlp_impersonate_target}")
-                _ = ydl.extract_info(video_url, download=True)  # Return value intentionally ignored; we read from disk instead
+                info = ydl.extract_info(video_url, download=True)
+
+                # Create video metadata from info dictionary
+                metadata = VideoMetadata.from_info(info)
 
                 # Find the downloaded VTT file
                 temp_path = Path(temp_dir)
@@ -262,18 +352,18 @@ class SubtitleExtractor:
                     # Clean all HTML/XML-style tags from VTT content
                     # First remove angle brackets, then use bleach for HTML sanitization
                     cleaned_vtt = self.TAG_REMOVAL_PATTERN.sub("", vtt_content)
-                    cleaned_vtt = bleach.clean(cleaned_vtt, tags=[], strip=True)
-                    return video_id, cleaned_vtt
+                    cleaned_vtt = nh3.clean(cleaned_vtt)
+                    return video_id, cleaned_vtt, metadata
                 else:
                     # Parse VTT to structured JSON
                     entries = self._parse_vtt_to_json(vtt_content)
                     if not entries:
                         raise ValueError(
-                            f"Failed to parse subtitles from VTT file. "
-                            f"The file may be malformed or use an unsupported format."
+                            "Failed to parse subtitles from VTT file. "
+                            "The file may be malformed or use an unsupported format."
                         )
                     logger.info(f"Parsed {len(entries)} subtitle entries")
-                    return video_id, entries
+                    return video_id, entries, metadata
 
     def list_available_languages(self, video_url: str) -> tuple[str, list[dict[str, Any]]]:
         """
@@ -320,7 +410,7 @@ class SubtitleExtractor:
 
             # Auto-generated subtitles (only if not already present)
             for lang_code, subs_list in automatic_subs.items():
-                if lang_code not in [l["code"] for l in languages]:
+                if lang_code not in [lang_entry["code"] for lang_entry in languages]:
                     formats = [s.get("ext", "vtt") for s in subs_list] if isinstance(subs_list, list) else ["vtt"]
                     languages.append({
                         "code": lang_code,

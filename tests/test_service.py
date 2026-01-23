@@ -47,7 +47,7 @@ This is a test subtitle
                 mock_cm.__exit__ = MagicMock(return_value=False)
                 mock_tempdir.return_value = mock_cm
 
-                video_id, result = extractor.extract_subtitles(
+                video_id, result, metadata = extractor.extract_subtitles(
                     "https://youtu.be/dQw4w9WgXcQ", "en", "json"
                 )
 
@@ -56,6 +56,8 @@ This is a test subtitle
         assert len(result) == 2
         assert result[0].text == "Hello world"
         assert result[1].text == "This is a test subtitle"
+        assert metadata is not None
+        assert metadata.video_id == "dQw4w9WgXcQ"
 
     def test_extract_subtitles_vtt_parsing(self, tmp_path):
         """Test VTT parsing to JSON conversion."""
@@ -89,13 +91,15 @@ Third subtitle
                 mock_cm.__exit__ = MagicMock(return_value=False)
                 mock_tempdir.return_value = mock_cm
 
-                video_id, result = extractor.extract_subtitles(
+                video_id, result, metadata = extractor.extract_subtitles(
                     "https://youtu.be/dQw4w9WgXcQ", "en", "json"
                 )
 
         assert len(result) == 3
         # Timestamp tags should be removed
         assert result[1].text == "Second subtitle"
+        assert metadata is not None
+        assert metadata.video_id == "dQw4w9WgXcQ"
 
     def test_extract_subtitles_vtt_format(self, tmp_path):
         """Test extracting subtitles in VTT format."""
@@ -122,7 +126,7 @@ Hello world
                 mock_cm.__exit__ = MagicMock(return_value=False)
                 mock_tempdir.return_value = mock_cm
 
-                video_id, result = extractor.extract_subtitles(
+                video_id, result, metadata = extractor.extract_subtitles(
                     "https://youtu.be/dQw4w9WgXcQ", "en", "vtt"
                 )
 
@@ -130,6 +134,8 @@ Hello world
         assert isinstance(result, str)
         assert "WEBVTT" in result
         assert "Hello world" in result
+        assert metadata is not None
+        assert metadata.video_id == "dQw4w9WgXcQ"
 
 
 class TestExtractSubtitlesErrors:

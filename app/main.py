@@ -7,8 +7,11 @@ YouTube videos with anti-bot detection strategies.
 
 import logging
 import re
+import time
+from collections import defaultdict
 from contextlib import asynccontextmanager
 from enum import Enum
+from threading import Lock
 from typing import cast
 
 import yt_dlp
@@ -17,7 +20,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
-from app.service import SubtitleEntry, SubtitleExtractor, get_extractor
+from app.service import SubtitleEntry, get_extractor
 from app.utils import is_valid_youtube_url
 
 # Caching
@@ -27,6 +30,9 @@ from app.cache import cache
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
+
+# Import database lifecycle for startup/shutdown
+from app.database import db_lifecycle, db_engine
 
 # Initialize rate limiter
 limiter = Limiter(key_func=get_remote_address)
@@ -40,16 +46,12 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Track app startup time for uptime calculation
-import time
-
 _app_start_time = time.time()
 
 # Simple in-memory rate limiting tracker (for conditional rate limiting)
-from collections import defaultdict
-from threading import Lock
-
 _rate_limit_tracker: defaultdict[str, list[float]] = defaultdict(list)
 _rate_limit_lock = Lock()
+_MAX_TRACKED_IPS = 10000  # Prevent memory leak from unbounded growth
 
 
 def _check_rate_limit(ip: str, max_requests: int, window_seconds: int = 60) -> bool:
@@ -75,6 +77,17 @@ def _check_rate_limit(ip: str, max_requests: int, window_seconds: int = 60) -> b
             return False
         # Add current request
         _rate_limit_tracker[ip].append(now)
+
+        # Prevent memory leak: clean up inactive IPs if tracking too many
+        if len(_rate_limit_tracker) > _MAX_TRACKED_IPS:
+            inactive_ips = [
+                tracked_ip for tracked_ip, timestamps in _rate_limit_tracker.items()
+                if all(now - t > window_seconds for t in timestamps)
+            ]
+            # Remove up to 10% of inactive IPs
+            for inactive_ip in inactive_ips[:max(1, _MAX_TRACKED_IPS // 10)]:
+                del _rate_limit_tracker[inactive_ip]
+
         return True
 
 
@@ -107,16 +120,16 @@ def sanitize_for_log(input_str: str) -> str:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage application lifespan events."""
-    # Startup
     from app.config import settings
 
+    # Startup
     logger.info("=" * 60)
     logger.info("YouTube Subtitle Microservice Starting")
     logger.info("=" * 60)
     logger.info("Anti-blocking strategies configured:")
     logger.info(f"  - Browser Impersonation: {settings.ytdlp_impersonate_target}")
     logger.info(f"  - Sleep Interval: {settings.ytdlp_sleep_seconds}s")
-    logger.info(f"  - Client Source: default,-web (PO Token bypass)")
+    logger.info("  - Client Source: default,-web (PO Token bypass)")
     logger.info("Security features:")
     logger.info(f"  - Rate Limiting: {'enabled' if settings.rate_limit_enabled else 'disabled'}")
     logger.info(f"  - Rate Limit: {settings.rate_limit_per_minute}/minute")
@@ -125,11 +138,26 @@ async def lifespan(app: FastAPI):
     logger.info(f"  - Caching: {'enabled' if settings.cache_enabled else 'disabled'}")
     logger.info(f"  - TTL: {settings.cache_ttl}s")
     logger.info(f"  - Max Size: {settings.cache_maxsize} entries")
+    logger.info("Database:")
+    logger.info("  - Type: SQLite (async with sqlmodel)")
+    logger.info(f"  - File: {settings.database_path}")
     logger.info("=" * 60)
+
+    # Initialize database on startup
+    try:
+        await db_lifecycle.startup()
+    except Exception as e:
+        logger.error(f"Failed to initialize database: {e}")
+        raise
 
     yield
 
-    # Shutdown (if needed)
+    # Shutdown database
+    try:
+        await db_lifecycle.shutdown()
+    except Exception as e:
+        logger.error(f"Error during database shutdown: {e}")
+        raise
 
 
 # Create FastAPI app
@@ -184,6 +212,26 @@ class SubtitleEntryModel(BaseModel):
     model_config = {"json_schema_extra": {"example": {"start": "00:00:00.000", "end": "00:00:03.500", "text": "Hello world"}}}
 
 
+class VideoMetadataResponse(BaseModel):
+    """Video metadata response model."""
+
+    video_id: str = Field(..., description="YouTube video ID (11 characters)")
+    title: str = Field(..., description="Video title")
+    description: str | None = Field(None, description="Video description")
+    duration: int | None = Field(None, description="Video duration in seconds")
+    duration_formatted: str | None = Field(None, description="Human-readable duration (HH:MM:SS)")
+    thumbnail: str | None = Field(None, description="URL to video thumbnail")
+    channel: str | None = Field(None, description="Channel name")
+    channel_id: str | None = Field(None, description="Channel ID")
+    upload_date: str | None = Field(None, description="Upload date (YYYYMMDD)")
+    view_count: int | None = Field(None, description="Number of views")
+    like_count: int | None = Field(None, description="Number of likes")
+    tags: list[str] = Field(default_factory=list, description="Video tags")
+    categories: list[str] = Field(default_factory=list, description="Video categories")
+    webpage_url: str | None = Field(None, description="Full video URL")
+    extractor: str = Field(default="youtube", description="Source extractor")
+
+
 class SubtitleResponse(BaseModel):
     """Response model for subtitle data in JSON format."""
 
@@ -191,6 +239,7 @@ class SubtitleResponse(BaseModel):
     language: str = Field(..., description="Language code of the subtitles")
     subtitle_count: int = Field(..., description="Number of subtitle entries")
     subtitles: list[SubtitleEntryModel] = Field(..., description="List of subtitle entries")
+    metadata: VideoMetadataResponse | None = Field(None, description="Video metadata")
 
     model_config = {
         "json_schema_extra": {
@@ -202,6 +251,14 @@ class SubtitleResponse(BaseModel):
                     {"start": "00:00:00.000", "end": "00:00:03.500", "text": "Hello world"},
                     {"start": "00:00:03.500", "end": "00:00:07.000", "text": "This is a test"},
                 ],
+                "metadata": {
+                    "video_id": "dQw4w9WgXcQ",
+                    "title": "Example Video",
+                    "duration": 300,
+                    "duration_formatted": "05:00",
+                    "channel": "Example Channel",
+                    "thumbnail": "https://img.youtube.com/vi/dQw4w9WgXcQ/maxresdefault.jpg",
+                },
             }
         }
     }
@@ -213,6 +270,7 @@ class SubtitleTextResponse(BaseModel):
     video_id: str = Field(..., description="YouTube video ID (11 characters)")
     language: str = Field(..., description="Language code of the subtitles")
     text: str = Field(..., description="Combined subtitle text content")
+    metadata: VideoMetadataResponse | None = Field(None, description="Video metadata")
 
     model_config = {
         "json_schema_extra": {
@@ -220,6 +278,13 @@ class SubtitleTextResponse(BaseModel):
                 "video_id": "dQw4w9WgXcQ",
                 "language": "en",
                 "text": "Hello world This is a test",
+                "metadata": {
+                    "video_id": "dQw4w9WgXcQ",
+                    "title": "Example Video",
+                    "duration": 300,
+                    "duration_formatted": "05:00",
+                    "channel": "Example Channel",
+                },
             }
         }
     }
@@ -460,14 +525,34 @@ async def get_subtitles(
         logger.warning(f"Invalid URL provided: {sanitize_for_log(video_url)}")
         raise HTTPException(
             status_code=400,
-            detail=f"Invalid YouTube URL. Expected format: https://www.youtube.com/watch?v=VIDEO_ID",
+            detail="Invalid YouTube URL. Expected format: https://www.youtube.com/watch?v=VIDEO_ID",
         )
 
-    # Check cache if enabled
+    # Check cache if enabled - try database first, then in-memory
     if settings.cache_enabled:
+        # Check database cache first (persistent across restarts)
+        db_entry = await db_engine.get_cached_subtitle(video_url, lang, format.value)
+        if db_entry is not None:
+            logger.info(f"DB cache hit for {sanitize_for_log(video_url)}")
+            cached_data = db_entry.subtitle_data
+            if format == OutputFormat.vtt:
+                return PlainTextResponse(
+                    content=cached_data,
+                    headers={
+                        "Content-Type": "text/vtt; charset=utf-8",
+                        "X-Video-ID": db_entry.video_id,
+                        "X-Cache": "HIT",
+                    },
+                )
+            elif format == OutputFormat.text:
+                return SubtitleTextResponse.model_validate_json(cached_data)
+            else:
+                return SubtitleResponse.model_validate_json(cached_data)
+
+        # Check in-memory cache
         cached_data = cache.get(video_url, lang, format.value)
         if cached_data is not None:
-            logger.info(f"Cache hit for {sanitize_for_log(video_url)}")
+            logger.info(f"Memory cache hit for {sanitize_for_log(video_url)}")
             # Return cached response based on format
             if format == OutputFormat.vtt:
                 # VTT format caches as {"video_id": ..., "vtt": "..."}
@@ -492,8 +577,27 @@ async def get_subtitles(
         # yt-dlp operations are synchronous and CPU-intensive
         from starlette.concurrency import run_in_threadpool
 
-        video_id, subtitle_data = await run_in_threadpool(
+        video_id, subtitle_data, metadata = await run_in_threadpool(
             extractor.extract_subtitles, video_url, lang, format.value
+        )
+
+        # Convert metadata to response model
+        metadata_response = VideoMetadataResponse(
+            video_id=metadata.video_id,
+            title=metadata.title,
+            description=metadata.description,
+            duration=metadata.duration,
+            duration_formatted=metadata.duration_formatted,
+            thumbnail=metadata.thumbnail,
+            channel=metadata.channel,
+            channel_id=metadata.channel_id,
+            upload_date=metadata.upload_date,
+            view_count=metadata.view_count,
+            like_count=metadata.like_count,
+            tags=metadata.tags,
+            categories=metadata.categories,
+            webpage_url=metadata.webpage_url,
+            extractor=metadata.extractor,
         )
 
         # Prepare response based on requested format
@@ -511,6 +615,11 @@ async def get_subtitles(
             # Cache the VTT content
             if settings.cache_enabled:
                 cache.set(video_url, lang, format.value, {"video_id": video_id, "vtt": subtitle_data})
+                # Persist to database with TTL
+                ttl_hours = settings.cache_ttl // 3600 or None
+                await db_engine.set_cached_subtitle(
+                    video_url, video_id, lang, format.value, subtitle_data, ttl_hours=ttl_hours
+                )
             return PlainTextResponse(
                 content=response_data["content"],
                 headers=response_data["headers"],
@@ -524,10 +633,16 @@ async def get_subtitles(
                 video_id=video_id,
                 language=lang,
                 text=combined_text,
+                metadata=metadata_response,
             )
             # Cache the text response
             if settings.cache_enabled:
-                cache.set(video_id, lang, format.value, text_response.model_dump())
+                cache.set(video_url, lang, format.value, text_response.model_dump())
+                # Persist to database with TTL
+                ttl_hours = settings.cache_ttl // 3600 or None
+                await db_engine.set_cached_subtitle(
+                    video_url, video_id, lang, format.value, text_response.model_dump_json(), ttl_hours=ttl_hours
+                )
             return text_response
         else:
             # Convert SubtitleEntry objects to Pydantic models (json format with timestamps)
@@ -541,10 +656,16 @@ async def get_subtitles(
                 language=lang,
                 subtitle_count=len(subtitle_models),
                 subtitles=subtitle_models,
+                metadata=metadata_response,
             )
             # Cache the JSON response
             if settings.cache_enabled:
                 cache.set(video_url, lang, format.value, json_response.model_dump())
+                # Persist to database with TTL
+                ttl_hours = settings.cache_ttl // 3600 or None
+                await db_engine.set_cached_subtitle(
+                    video_url, video_id, lang, format.value, json_response.model_dump_json(), ttl_hours=ttl_hours
+                )
             return json_response
 
     except ValueError as e:
@@ -674,8 +795,26 @@ async def batch_extract_subtitles(
                 )
                 continue
 
-            # Check cache
+            # Check cache - try database first, then in-memory
             if settings.cache_enabled:
+                # Check database cache
+                db_entry = await db_engine.get_cached_subtitle(video_url, lang, format)
+                if db_entry is not None:
+                    cached = db_entry.subtitle_data
+                    # Parse from JSON to dict
+                    import json
+                    cached_dict = json.loads(cached)
+                    results.append(
+                        BatchResponseItem(
+                            video_url=video_url,
+                            success=True,
+                            video_id=db_entry.video_id,
+                            data=cached_dict,
+                        )
+                    )
+                    continue
+
+                # Check in-memory cache
                 cached = cache.get(video_url, lang, format)
                 if cached is not None:
                     results.append(
@@ -691,9 +830,28 @@ async def batch_extract_subtitles(
             # Extract subtitles
             from starlette.concurrency import run_in_threadpool
 
-            video_id, subtitle_data = await run_in_threadpool(
+            video_id, subtitle_data, metadata = await run_in_threadpool(
                 extractor.extract_subtitles, video_url, lang, format
             )
+
+            # Build metadata dict
+            metadata_dict = {
+                "video_id": metadata.video_id,
+                "title": metadata.title,
+                "description": metadata.description,
+                "duration": metadata.duration,
+                "duration_formatted": metadata.duration_formatted,
+                "thumbnail": metadata.thumbnail,
+                "channel": metadata.channel,
+                "channel_id": metadata.channel_id,
+                "upload_date": metadata.upload_date,
+                "view_count": metadata.view_count,
+                "like_count": metadata.like_count,
+                "tags": metadata.tags,
+                "categories": metadata.categories,
+                "webpage_url": metadata.webpage_url,
+                "extractor": metadata.extractor,
+            }
 
             # Prepare response data
             if format == "json":
@@ -705,13 +863,16 @@ async def batch_extract_subtitles(
                         {"start": s.start, "end": s.end, "text": s.text}
                         for s in subtitle_data
                     ],
+                    "metadata": metadata_dict,
                 }
             elif format == "text":
                 combined = " ".join(s.text for s in subtitle_data)
+                combined = re.sub(r"\s+", " ", combined).strip()
                 data = {
                     "video_id": video_id,
                     "language": lang,
-                    "text": re.sub(r"\s+", " ", combined).strip(),
+                    "text": combined,
+                    "metadata": metadata_dict,
                 }
             else:  # vtt
                 data = {"video_id": video_id, "vtt": subtitle_data}
@@ -719,6 +880,12 @@ async def batch_extract_subtitles(
             # Cache result
             if settings.cache_enabled:
                 cache.set(video_url, lang, format, data)
+                # Persist to database with TTL
+                import json
+                ttl_hours = settings.cache_ttl // 3600 or None
+                await db_engine.set_cached_subtitle(
+                    video_url, video_id, lang, format, json.dumps(data), ttl_hours=ttl_hours
+                )
 
             results.append(
                 BatchResponseItem(
