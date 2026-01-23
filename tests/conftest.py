@@ -13,7 +13,10 @@ from app.main import app
 @pytest.fixture
 def client():
     """FastAPI TestClient for endpoint testing."""
-    return TestClient(app)
+    # Mock rate limiting to always allow during tests
+    with patch("app.main._check_rate_limit", return_value=True):
+        with patch("app.cache.cache.get", return_value=None):  # Disable cache for tests
+            yield TestClient(app)
 
 
 @pytest.fixture

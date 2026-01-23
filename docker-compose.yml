@@ -1,0 +1,65 @@
+version: "3.8"
+
+services:
+  # Main ytdlp-microservice
+  ytdlp-microservice:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ytdlp-microservice
+    ports:
+      - "8000:8000"
+    environment:
+      # Server Configuration
+      - HOST=0.0.0.0
+      - PORT=8000
+      - LOG_LEVEL=info
+
+      # YouTube Extraction
+      - YTDLP_SLEEP_SECONDS=60
+      - YTDLP_IMPERSONATE_TARGET=chrome
+      - YTDLP_TEMP_DIR=/tmp/ytdlp
+      - YTDLP_REQUEST_TIMEOUT=120
+
+      # Caching
+      - CACHE_ENABLED=true
+      - CACHE_TTL=3600
+      - CACHE_MAXSIZE=1000
+
+      # Rate Limiting
+      - RATE_LIMIT_ENABLED=true
+      - RATE_LIMIT_PER_MINUTE=10
+
+      # Security
+      - ENABLE_SECURITY_HEADERS=true
+    volumes:
+      - subtitle_temp:/tmp/ytdlp
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+
+  # Optional Redis for caching (future use)
+  redis:
+    image: redis:7-alpine
+    container_name: ytdlp-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+volumes:
+  subtitle_temp:
+    driver: local
+  redis_data:
+    driver: local

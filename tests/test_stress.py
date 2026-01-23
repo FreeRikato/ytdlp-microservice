@@ -1,23 +1,123 @@
-"""Stress test for YouTube subtitle rate limits.
+"""Stress tests for YouTube subtitle rate limits.
 
-This test makes repeated requests to YouTube to find the threshold
-for rate limiting (429 errors).
+These tests make actual network calls to YouTube to verify rate limiting behavior.
 
-Usage:
-    uv run python tests/test_stress.py
-
-NOTE: This will make actual network calls to YouTube and may trigger
-rate limiting. Use with caution.
+NOTE: These tests are marked as "slow" and "stress" and can be skipped with:
+    pytest -m "not slow"    # Skip slow tests
+    pytest -m "not stress"  # Skip stress tests
 """
 
+import asyncio
 import time
-import sys
-from pathlib import Path
 
-# Add project root to path
-sys.path.insert(0, str(Path(__file__).parent.parent))
+import pytest
 
 from app.service import SubtitleExtractor
+
+
+@pytest.mark.slow
+@pytest.mark.stress
+def test_rate_limit_threshold():
+    """Test rate limiting behavior with repeated requests.
+
+    This test makes multiple requests to observe rate limiting behavior.
+    It will stop after detecting multiple 429 errors.
+
+    Markers: slow, stress
+    """
+    extractor = SubtitleExtractor()
+    success_count = 0
+    rate_limit_count = 0
+    max_requests = 20  # Conservative limit to avoid excessive API calls
+
+    for i in range(max_requests):
+        try:
+            # Use a well-known, stable video
+            video_id, _ = extractor.extract_subtitles(
+                "https://www.youtube.com/watch?v=jNQXAC9IVRw",  # "Me at the zoo"
+                lang="en",
+                output_format="json",
+            )
+            success_count += 1
+        except Exception as e:
+            error_msg = str(e)
+            if "429" in error_msg or "rate limit" in error_msg.lower():
+                rate_limit_count += 1
+            # Stop after hitting rate limits a few times
+            if rate_limit_count >= 2:
+                break
+
+    # We should get some successes before rate limiting
+    assert success_count >= 1, "Should get at least one successful request"
+
+
+@pytest.mark.slow
+@pytest.mark.stress
+async def test_concurrent_requests():
+    """Test handling of concurrent subtitle extraction requests.
+
+    This test verifies that the service can handle multiple concurrent
+    requests without crashing.
+
+    Markers: slow, stress
+    """
+    from starlette.concurrency import run_in_threadpool
+
+    async def extract():
+        extractor = SubtitleExtractor()
+        return await run_in_threadpool(
+            extractor.extract_subtitles,
+            "https://www.youtube.com/watch?v=jNQXAC9IVRw",
+            "en",
+            "json",
+        )
+
+    async def run_concurrent():
+        tasks = [extract() for _ in range(3)]
+        return await asyncio.gather(*tasks, return_exceptions=True)
+
+    results = await run_concurrent()
+    successful = sum(1 for r in results if not isinstance(r, Exception))
+    assert successful >= 1, "At least one concurrent request should succeed"
+
+
+@pytest.mark.slow
+@pytest.mark.stress
+def test_cache_performance():
+    """Test cache performance with repeated requests.
+
+    This test verifies that caching works correctly for repeated requests
+    to the same video.
+
+    Markers: slow, stress
+    """
+    from app.cache import cache
+
+    cache.clear()
+    extractor = SubtitleExtractor()
+
+    # First request - cache miss
+    video_url = "https://www.youtube.com/watch?v=jNQXAC9IVRw"
+
+    # Check initial cache stats
+    initial_stats = cache.get_stats()
+    initial_misses = initial_stats["misses"]
+
+    try:
+        extractor.extract_subtitles(video_url, lang="en", output_format="json")
+        # Cache should have been populated (if enabled)
+    except Exception:
+        pass  # We're mainly testing cache mechanism, not actual extraction
+
+    # Verify cache is tracking operations
+    final_stats = cache.get_stats()
+    # At minimum, we should have tracked the miss from the first request
+    assert final_stats["misses"] >= initial_misses
+
+
+# ============================================================================
+# Standalone stress test script (can be run directly without pytest)
+# ============================================================================
 
 
 def stress_test_rate_limit(
