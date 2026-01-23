@@ -256,8 +256,18 @@ def configure_middleware():
     """Configure middleware based on settings."""
     from app.config import settings
     from app.middleware import SecurityHeadersMiddleware
+    from fastapi.middleware.cors import CORSMiddleware
 
-    # Add request ID middleware first (runs first in chain)
+    # Add CORS middleware first (runs first in chain)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+    logger.info("CORS middleware enabled")
+
+    # Add request ID middleware
     app.add_middleware(RequestIdMiddleware)
     logger.info("Request ID middleware enabled")
 
