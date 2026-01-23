@@ -20,12 +20,83 @@ from pydantic import BaseModel, Field
 from app.service import SubtitleEntry, SubtitleExtractor, get_extractor
 from app.utils import is_valid_youtube_url
 
+# Caching
+from app.cache import cache
+
+# Rate limiting
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+
+# Initialize rate limiter
+limiter = Limiter(key_func=get_remote_address)
+rate_limit_exception_handler = _rate_limit_exceeded_handler
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+# Track app startup time for uptime calculation
+import time
+
+_app_start_time = time.time()
+
+# Simple in-memory rate limiting tracker (for conditional rate limiting)
+from collections import defaultdict
+from threading import Lock
+
+_rate_limit_tracker: defaultdict[str, list[float]] = defaultdict(list)
+_rate_limit_lock = Lock()
+
+
+def _check_rate_limit(ip: str, max_requests: int, window_seconds: int = 60) -> bool:
+    """
+    Check if the IP has exceeded the rate limit.
+
+    Args:
+        ip: Client IP address
+        max_requests: Maximum requests allowed
+        window_seconds: Time window in seconds
+
+    Returns:
+        True if request is allowed, False if rate limit exceeded
+    """
+    with _rate_limit_lock:
+        now = time.time()
+        # Clean old entries
+        _rate_limit_tracker[ip] = [
+            t for t in _rate_limit_tracker[ip] if now - t < window_seconds
+        ]
+        # Check limit
+        if len(_rate_limit_tracker[ip]) >= max_requests:
+            return False
+        # Add current request
+        _rate_limit_tracker[ip].append(now)
+        return True
+
+
+# ============================================================================
+# Utility Functions
+# ============================================================================
+
+
+def sanitize_for_log(input_str: str) -> str:
+    """
+    Sanitize user input for logging to prevent log injection attacks.
+
+    Replaces newlines, carriage returns, and tabs with their escaped
+    representations to prevent malicious log injection.
+
+    Args:
+        input_str: User input string to sanitize
+
+    Returns:
+        Sanitized string safe for logging
+    """
+    return input_str.replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
 
 
 # ============================================================================
@@ -46,6 +117,14 @@ async def lifespan(app: FastAPI):
     logger.info(f"  - Browser Impersonation: {settings.ytdlp_impersonate_target}")
     logger.info(f"  - Sleep Interval: {settings.ytdlp_sleep_seconds}s")
     logger.info(f"  - Client Source: default,-web (PO Token bypass)")
+    logger.info("Security features:")
+    logger.info(f"  - Rate Limiting: {'enabled' if settings.rate_limit_enabled else 'disabled'}")
+    logger.info(f"  - Rate Limit: {settings.rate_limit_per_minute}/minute")
+    logger.info(f"  - Security Headers: {'enabled' if settings.enable_security_headers else 'disabled'}")
+    logger.info("Cache settings:")
+    logger.info(f"  - Caching: {'enabled' if settings.cache_enabled else 'disabled'}")
+    logger.info(f"  - TTL: {settings.cache_ttl}s")
+    logger.info(f"  - Max Size: {settings.cache_maxsize} entries")
     logger.info("=" * 60)
 
     yield
@@ -57,11 +136,37 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="YouTube Subtitle Microservice",
     description="Extract subtitles from YouTube videos with anti-bot detection",
-    version="0.1.0",
+    version="0.2.0",
     docs_url="/docs",
     redoc_url="/redoc",
     lifespan=lifespan,
 )
+
+
+# ============================================================================
+# Middleware Configuration
+# ============================================================================
+
+
+def configure_middleware():
+    """Configure middleware based on settings."""
+    from app.config import settings
+    from app.middleware import SecurityHeadersMiddleware
+
+    # Add security headers middleware
+    if settings.enable_security_headers:
+        app.add_middleware(SecurityHeadersMiddleware)
+        logger.info("Security headers middleware enabled")
+
+    # Configure rate limiting
+    if settings.rate_limit_enabled:
+        app.state.limiter = limiter
+        app.add_exception_handler(RateLimitExceeded, rate_limit_exception_handler)
+        logger.info(f"Rate limiting enabled: {settings.rate_limit_per_minute} requests/minute")
+
+
+# Configure middleware on import
+configure_middleware()
 
 
 # ============================================================================
@@ -137,6 +242,65 @@ class OutputFormat(str, Enum):
 
 
 # ============================================================================
+# Additional Pydantic Models for New Endpoints
+# ============================================================================
+
+
+class LanguageInfo(BaseModel):
+    """Information about an available subtitle language."""
+
+    code: str = Field(..., description="ISO 639-1 language code")
+    name: str = Field(..., description="Language name")
+    auto_generated: bool = Field(..., description="Whether subtitle is auto-generated")
+    formats: list[str] = Field(default_factory=list, description="Available subtitle formats")
+
+
+class LanguagesResponse(BaseModel):
+    """Response model for available languages endpoint."""
+
+    video_id: str = Field(..., description="YouTube video ID")
+    languages: list[LanguageInfo] = Field(..., description="Available subtitle languages")
+
+
+class BatchVideoRequest(BaseModel):
+    """Request model for a single video in batch extraction."""
+
+    video_url: str = Field(..., max_length=500, description="YouTube video URL or ID")
+    lang: str = Field(default="en", description="Language code")
+    format: str = Field(default="json", description="Output format")
+
+
+class BatchRequest(BaseModel):
+    """Request model for batch subtitle extraction."""
+
+    videos: list[BatchVideoRequest] = Field(
+        ..., max_length=10, description="List of video requests (max 10)"
+    )
+
+
+class BatchResponseItem(BaseModel):
+    """Response item for batch extraction."""
+
+    video_url: str = Field(..., description="The requested video URL")
+    success: bool = Field(..., description="Whether extraction succeeded")
+    video_id: str | None = Field(None, description="YouTube video ID if successful")
+    data: dict | None = Field(None, description="Subtitle data if successful")
+    error: str | None = Field(None, description="Error message if failed")
+
+
+class HealthResponse(BaseModel):
+    """Response model for enhanced health check."""
+
+    status: str = Field(..., description="Service status")
+    service: str = Field(..., description="Service name")
+    version: str = Field(..., description="Service version")
+    timestamp: float = Field(..., description="Current Unix timestamp")
+    uptime_seconds: float = Field(..., description="Service uptime in seconds")
+    cache: dict = Field(default_factory=dict, description="Cache statistics")
+    rate_limiting: dict = Field(default_factory=dict, description="Rate limiting status")
+
+
+# ============================================================================
 # Exception Handlers
 # ============================================================================
 
@@ -183,11 +347,25 @@ async def download_error_handler(request: Request, exc: yt_dlp.utils.DownloadErr
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    """Handle Pydantic validation errors."""
-    logger.warning(f"Validation error: {exc}")
+    """
+    Handle Pydantic validation errors with detailed feedback.
+
+    Includes specific field and error information to help developers
+    understand what went wrong with their request.
+    """
+    errors = exc.errors()
+    logger.warning(f"Validation error: {errors}")
+
+    # Format error details for better developer experience
+    error_details = []
+    for error in errors:
+        loc = " -> ".join(str(x) for x in error["loc"])
+        error_details.append(f"{loc}: {error["msg"]}")
+
     error_response = ErrorResponse(
         error="validation_error",
         message="Invalid request parameters",
+        detail="; ".join(error_details),
     )
     return Response(
         content=error_response.model_dump_json(),
@@ -214,9 +392,21 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     summary="Extract subtitles from a YouTube video",
 )
 async def get_subtitles(
-    video_url: str = Query(..., description="YouTube video URL (e.g., https://www.youtube.com/watch?v=xxx)"),
-    lang: str = Query("en", description="Language code for subtitles (e.g., en, es, fr)"),
-    format: OutputFormat = Query(OutputFormat.json, description="Output format: json, vtt, or text"),
+    request: Request,
+    video_url: str = Query(
+        ...,
+        max_length=500,
+        description="YouTube video URL (e.g., https://www.youtube.com/watch?v=xxx)",
+    ),
+    lang: str = Query(
+        "en",
+        pattern=r"^[a-z]{2}(-[A-Z]{2})?$",
+        max_length=10,
+        description="Language code for subtitles (e.g., en, es, en-US)",
+    ),
+    format: OutputFormat = Query(
+        OutputFormat.json, description="Output format: json, vtt, or text"
+    ),
 ) -> SubtitleResponse | SubtitleTextResponse | PlainTextResponse:
     """
     Extract subtitles from a YouTube video.
@@ -251,15 +441,48 @@ async def get_subtitles(
     - 200: Success
     - 400: Invalid URL or parameters
     - 404: Subtitles not found for the video/language
+    - 429: Too many requests (rate limit exceeded)
     - 503: YouTube rate limit detected (retry after 60 seconds)
     """
+    from app.config import settings
+
+    # Apply rate limiting if enabled
+    if settings.rate_limit_enabled:
+        client_ip = get_remote_address(request)
+        if not _check_rate_limit(client_ip, settings.rate_limit_per_minute):
+            raise HTTPException(
+                status_code=429,
+                detail=f"Rate limit exceeded. Maximum {settings.rate_limit_per_minute} requests per minute.",
+            )
+
     # Validate URL
     if not is_valid_youtube_url(video_url):
-        logger.warning(f"Invalid URL provided: {video_url}")
+        logger.warning(f"Invalid URL provided: {sanitize_for_log(video_url)}")
         raise HTTPException(
             status_code=400,
-            detail=f"Invalid YouTube URL: {video_url}. Expected format: https://www.youtube.com/watch?v=VIDEO_ID",
+            detail=f"Invalid YouTube URL. Expected format: https://www.youtube.com/watch?v=VIDEO_ID",
         )
+
+    # Check cache if enabled
+    if settings.cache_enabled:
+        cached_data = cache.get(video_url, lang, format.value)
+        if cached_data is not None:
+            logger.info(f"Cache hit for {sanitize_for_log(video_url)}")
+            # Return cached response based on format
+            if format == OutputFormat.vtt:
+                # VTT format caches as {"video_id": ..., "vtt": "..."}
+                return PlainTextResponse(
+                    content=cast(str, cached_data["vtt"]),
+                    headers={
+                        "Content-Type": "text/vtt; charset=utf-8",
+                        "X-Video-ID": cached_data.get("video_id", ""),
+                        "X-Cache": "HIT",
+                    },
+                )
+            elif format == OutputFormat.text:
+                return SubtitleTextResponse(**cached_data)
+            else:
+                return SubtitleResponse(**cached_data)
 
     # Get extractor and run in thread pool (yt-dlp is blocking)
     extractor = get_extractor()
@@ -273,26 +496,39 @@ async def get_subtitles(
             extractor.extract_subtitles, video_url, lang, format.value
         )
 
-        # Return based on requested format
+        # Prepare response based on requested format
+        response_data = None
         if format == OutputFormat.vtt:
             # Return raw VTT content
-            return PlainTextResponse(
-                content=cast(str, subtitle_data),
-                headers={
+            response_data = {
+                "content": cast(str, subtitle_data),
+                "headers": {
                     "Content-Type": "text/vtt; charset=utf-8",
                     "X-Video-ID": video_id,
+                    "X-Cache": "MISS",
                 },
+            }
+            # Cache the VTT content
+            if settings.cache_enabled:
+                cache.set(video_url, lang, format.value, {"video_id": video_id, "vtt": subtitle_data})
+            return PlainTextResponse(
+                content=response_data["content"],
+                headers=response_data["headers"],
             )
         elif format == OutputFormat.text:
             # Combine all subtitle text into single string
             combined_text = " ".join(entry.text for entry in cast(list[SubtitleEntry], subtitle_data))
             # Normalize whitespace
             combined_text = re.sub(r"\s+", " ", combined_text).strip()
-            return SubtitleTextResponse(
+            text_response = SubtitleTextResponse(
                 video_id=video_id,
                 language=lang,
                 text=combined_text,
             )
+            # Cache the text response
+            if settings.cache_enabled:
+                cache.set(video_id, lang, format.value, text_response.model_dump())
+            return text_response
         else:
             # Convert SubtitleEntry objects to Pydantic models (json format with timestamps)
             subtitle_models = [
@@ -300,32 +536,236 @@ async def get_subtitles(
                 for entry in cast(list[SubtitleEntry], subtitle_data)
             ]
 
-            return SubtitleResponse(
+            json_response = SubtitleResponse(
                 video_id=video_id,
                 language=lang,
                 subtitle_count=len(subtitle_models),
                 subtitles=subtitle_models,
             )
+            # Cache the JSON response
+            if settings.cache_enabled:
+                cache.set(video_url, lang, format.value, json_response.model_dump())
+            return json_response
 
     except ValueError as e:
         # No subtitles found or parsing error
-        logger.warning(f"Value error during extraction: {e}")
+        logger.warning(f"Value error during extraction: {sanitize_for_log(str(e))}")
         raise HTTPException(status_code=404, detail=str(e))
     except yt_dlp.utils.DownloadError as e:
         # Let the global handler handle this
         raise e
 
 
-@app.get("/", summary="Health check")
+@app.get(
+    "/api/v1/subtitles/languages",
+    response_model=LanguagesResponse,
+    responses={
+        200: {"description": "Available languages retrieved"},
+        400: {"model": ErrorResponse, "description": "Invalid URL"},
+        404: {"model": ErrorResponse, "description": "Video not found"},
+    },
+    summary="List available subtitle languages for a video",
+)
+async def list_languages(
+    request: Request,
+    video_url: str = Query(..., max_length=500, description="YouTube video URL"),
+) -> LanguagesResponse:
+    """
+    Get list of available subtitle languages for a video.
+
+    Returns all available subtitle languages including manual and auto-generated
+    subtitles with their formats.
+
+    **Example:**
+    ```bash
+    curl "http://localhost:8000/api/v1/subtitles/languages?video_url=dQw4w9WgXcQ"
+    ```
+    """
+    from app.config import settings
+
+    # Apply rate limiting if enabled
+    if settings.rate_limit_enabled:
+        client_ip = get_remote_address(request)
+        if not _check_rate_limit(client_ip, settings.rate_limit_per_minute):
+            raise HTTPException(
+                status_code=429,
+                detail=f"Rate limit exceeded. Maximum {settings.rate_limit_per_minute} requests per minute.",
+            )
+
+    # Validate URL
+    if not is_valid_youtube_url(video_url):
+        logger.warning(f"Invalid URL provided: {sanitize_for_log(video_url)}")
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid YouTube URL. Expected format: https://www.youtube.com/watch?v=VIDEO_ID",
+        )
+
+    # Get languages
+    extractor = get_extractor()
+    from starlette.concurrency import run_in_threadpool
+
+    try:
+        video_id, languages = await run_in_threadpool(
+            extractor.list_available_languages, video_url
+        )
+        return LanguagesResponse(
+            video_id=video_id,
+            languages=[LanguageInfo(**lang) for lang in languages],
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.post(
+    "/api/v1/subtitles/batch",
+    response_model=list[BatchResponseItem],
+    responses={
+        200: {"description": "Batch extraction completed"},
+        400: {"model": ErrorResponse, "description": "Invalid request"},
+        429: {"model": ErrorResponse, "description": "Too many requests"},
+    },
+    summary="Extract subtitles for multiple videos in one request",
+)
+async def batch_extract_subtitles(
+    request: Request,
+    batch: BatchRequest,
+) -> list[BatchResponseItem]:
+    """
+    Extract subtitles for multiple videos in one request.
+
+    **Limits:**
+    - Maximum 10 videos per batch
+    - 30 requests per minute per IP (higher than single endpoint)
+
+    **Example:**
+    ```bash
+    curl -X POST "http://localhost:8000/api/v1/subtitles/batch" \\
+      -H "Content-Type: application/json" \\
+      -d '{"videos": [{"video_url": "dQw4w9WgXcQ", "lang": "en", "format": "json"}]}'
+    ```
+    """
+    from app.config import settings
+
+    # Apply rate limiting (higher limit for batch)
+    if settings.rate_limit_enabled:
+        client_ip = get_remote_address(request)
+        # Use 3x the normal limit for batch requests
+        batch_limit = settings.rate_limit_per_minute * 3
+        if not _check_rate_limit(client_ip, batch_limit):
+            raise HTTPException(
+                status_code=429,
+                detail=f"Rate limit exceeded. Maximum {batch_limit} requests per minute.",
+            )
+
+    results = []
+    extractor = get_extractor()
+
+    for video_req in batch.videos:
+        video_url = video_req.video_url
+        lang = video_req.lang
+        format = video_req.format
+
+        try:
+            if not is_valid_youtube_url(video_url):
+                results.append(
+                    BatchResponseItem(
+                        video_url=video_url, success=False, error="Invalid YouTube URL"
+                    )
+                )
+                continue
+
+            # Check cache
+            if settings.cache_enabled:
+                cached = cache.get(video_url, lang, format)
+                if cached is not None:
+                    results.append(
+                        BatchResponseItem(
+                            video_url=video_url,
+                            success=True,
+                            video_id=cached.get("video_id"),
+                            data=cached,
+                        )
+                    )
+                    continue
+
+            # Extract subtitles
+            from starlette.concurrency import run_in_threadpool
+
+            video_id, subtitle_data = await run_in_threadpool(
+                extractor.extract_subtitles, video_url, lang, format
+            )
+
+            # Prepare response data
+            if format == "json":
+                data = {
+                    "video_id": video_id,
+                    "language": lang,
+                    "subtitle_count": len(subtitle_data),
+                    "subtitles": [
+                        {"start": s.start, "end": s.end, "text": s.text}
+                        for s in subtitle_data
+                    ],
+                }
+            elif format == "text":
+                combined = " ".join(s.text for s in subtitle_data)
+                data = {
+                    "video_id": video_id,
+                    "language": lang,
+                    "text": re.sub(r"\s+", " ", combined).strip(),
+                }
+            else:  # vtt
+                data = {"video_id": video_id, "vtt": subtitle_data}
+
+            # Cache result
+            if settings.cache_enabled:
+                cache.set(video_url, lang, format, data)
+
+            results.append(
+                BatchResponseItem(
+                    video_url=video_url, success=True, video_id=video_id, data=data
+                )
+            )
+
+        except Exception as e:
+            logger.error(f"Batch extraction error for {video_url}: {e}")
+            results.append(
+                BatchResponseItem(
+                    video_url=video_url, success=False, error=str(e)[:200]
+                )
+            )
+
+    return results
+
+
+@app.get("/", summary="Simple health check")
 async def root() -> dict[str, str]:
-    """Health check endpoint."""
-    return {"status": "healthy", "service": "ytdlp-microservice", "version": "0.1.0"}
+    """Simple health check endpoint."""
+    return {"status": "healthy", "service": "ytdlp-microservice", "version": "0.2.0"}
 
 
-@app.get("/health", summary="Health check endpoint")
-async def health() -> dict[str, str]:
-    """Health check endpoint."""
-    return {"status": "healthy", "service": "ytdlp-microservice", "version": "0.1.0"}
+@app.get("/health", response_model=HealthResponse, summary="Enhanced health check")
+async def health() -> HealthResponse:
+    """
+    Enhanced health check with service metrics.
+
+    Returns service status, uptime, and cache statistics.
+    """
+    from app.config import settings
+
+    cache_stats = cache.get_stats() if settings.cache_enabled else {"enabled": False}
+
+    return HealthResponse(
+        status="healthy",
+        service="ytdlp-microservice",
+        version="0.2.0",
+        timestamp=time.time(),
+        uptime_seconds=time.time() - _app_start_time,
+        cache=cache_stats,
+        rate_limiting={
+            "enabled": settings.rate_limit_enabled,
+            "per_minute": settings.rate_limit_per_minute,
+        },
+    )
 
 
 if __name__ == "__main__":
