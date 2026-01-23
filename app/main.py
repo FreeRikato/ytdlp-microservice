@@ -5,20 +5,27 @@ This module provides a REST API endpoint for extracting subtitles from
 YouTube videos with anti-bot detection strategies.
 """
 
+import asyncio
 import logging
 import re
 import time
+import uuid
 from collections import defaultdict
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from enum import Enum
-from threading import Lock
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 import yt_dlp
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
+from starlette.middleware.base import BaseHTTPMiddleware
+from structlog.contextvars import bind_contextvars, clear_contextvars
+
+if TYPE_CHECKING:
+    from app.service import VideoMetadata
 
 from app.service import SubtitleEntry, get_extractor
 from app.utils import is_valid_youtube_url
@@ -28,33 +35,54 @@ from app.cache import cache
 
 # Rate limiting
 from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
 # Import database lifecycle for startup/shutdown
 from app.database import db_lifecycle, db_engine
 
-# Initialize rate limiter
-limiter = Limiter(key_func=get_remote_address)
-rate_limit_exception_handler = _rate_limit_exceeded_handler
+# Configure logging with request ID context
+import structlog
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+structlog.configure(
+    processors=[
+        structlog.contextvars.merge_contextvars,
+        structlog.processors.add_log_level,
+        structlog.processors.TimeStamper(fmt="iso"),
+        structlog.dev.ConsoleRenderer(),
+    ],
+    wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
+    context_class=dict,
+    logger_factory=structlog.PrintLoggerFactory(),
+    cache_logger_on_first_use=True,
 )
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger()
+
+# Request ID context variable
+request_id_var: ContextVar[str] = ContextVar("request_id", default="")
+
+
+def get_remote_address_proxied(request: Request) -> str:
+    """Get client address, considering X-Forwarded-For header."""
+    forwarded = request.headers.get("X-Forwarded-For")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host
+
+
+# Initialize rate limiter with proxy support
+limiter = Limiter(key_func=get_remote_address_proxied)
+rate_limit_exception_handler = _rate_limit_exceeded_handler
 
 # Track app startup time for uptime calculation
 _app_start_time = time.time()
 
 # Simple in-memory rate limiting tracker (for conditional rate limiting)
 _rate_limit_tracker: defaultdict[str, list[float]] = defaultdict(list)
-_rate_limit_lock = Lock()
+_rate_limit_lock = asyncio.Lock()
 _MAX_TRACKED_IPS = 10000  # Prevent memory leak from unbounded growth
 
 
-def _check_rate_limit(ip: str, max_requests: int, window_seconds: int = 60) -> bool:
+async def _check_rate_limit(ip: str, max_requests: int, window_seconds: int = 60) -> bool:
     """
     Check if the IP has exceeded the rate limit.
 
@@ -66,7 +94,7 @@ def _check_rate_limit(ip: str, max_requests: int, window_seconds: int = 60) -> b
     Returns:
         True if request is allowed, False if rate limit exceeded
     """
-    with _rate_limit_lock:
+    async with _rate_limit_lock:
         now = time.time()
         # Clean old entries
         _rate_limit_tracker[ip] = [
@@ -110,6 +138,35 @@ def sanitize_for_log(input_str: str) -> str:
         Sanitized string safe for logging
     """
     return input_str.replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+
+
+def metadata_to_response_dict(metadata: "VideoMetadata") -> dict:
+    """
+    Convert VideoMetadata to a dictionary for API responses.
+
+    Args:
+        metadata: VideoMetadata object from the extractor
+
+    Returns:
+        Dictionary suitable for API response serialization
+    """
+    return {
+        "video_id": metadata.video_id,
+        "title": metadata.title,
+        "description": metadata.description,
+        "duration": metadata.duration,
+        "duration_formatted": metadata.duration_formatted,
+        "thumbnail": metadata.thumbnail,
+        "channel": metadata.channel,
+        "channel_id": metadata.channel_id,
+        "upload_date": metadata.upload_date,
+        "view_count": metadata.view_count,
+        "like_count": metadata.like_count,
+        "tags": metadata.tags,
+        "categories": metadata.categories,
+        "webpage_url": metadata.webpage_url,
+        "extractor": metadata.extractor,
+    }
 
 
 # ============================================================================
@@ -176,10 +233,43 @@ app = FastAPI(
 # ============================================================================
 
 
+class RequestIdMiddleware(BaseHTTPMiddleware):
+    """Middleware to add request ID for tracing."""
+
+    async def dispatch(self, request: Request, call_next):
+        """Process request and add request ID."""
+        # Generate or extract request ID
+        request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
+        request_id_var.set(request_id)
+
+        # Clear and bind context vars for structured logging
+        clear_contextvars()
+        bind_contextvars(request_id=request_id)
+
+        # Add request ID to response headers
+        response = await call_next(request)
+        response.headers["X-Request-ID"] = request_id
+        return response
+
+
 def configure_middleware():
     """Configure middleware based on settings."""
     from app.config import settings
     from app.middleware import SecurityHeadersMiddleware
+    from fastapi.middleware.cors import CORSMiddleware
+
+    # Add CORS middleware first (runs first in chain)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["chrome-extension://lbaapiiaojechkkibeccnbfdifjadgdn"],
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+    logger.info("CORS middleware enabled")
+
+    # Add request ID middleware
+    app.add_middleware(RequestIdMiddleware)
+    logger.info("Request ID middleware enabled")
 
     # Add security headers middleware
     if settings.enable_security_headers:
@@ -363,6 +453,7 @@ class HealthResponse(BaseModel):
     uptime_seconds: float = Field(..., description="Service uptime in seconds")
     cache: dict = Field(default_factory=dict, description="Cache statistics")
     rate_limiting: dict = Field(default_factory=dict, description="Rate limiting status")
+    database: dict = Field(default_factory=dict, description="Database status")
 
 
 # ============================================================================
@@ -513,8 +604,8 @@ async def get_subtitles(
 
     # Apply rate limiting if enabled
     if settings.rate_limit_enabled:
-        client_ip = get_remote_address(request)
-        if not _check_rate_limit(client_ip, settings.rate_limit_per_minute):
+        client_ip = get_remote_address_proxied(request)
+        if not await _check_rate_limit(client_ip, settings.rate_limit_per_minute):
             raise HTTPException(
                 status_code=429,
                 detail=f"Rate limit exceeded. Maximum {settings.rate_limit_per_minute} requests per minute.",
@@ -550,7 +641,7 @@ async def get_subtitles(
                 return SubtitleResponse.model_validate_json(cached_data)
 
         # Check in-memory cache
-        cached_data = cache.get(video_url, lang, format.value)
+        cached_data = await cache.get(video_url, lang, format.value)
         if cached_data is not None:
             logger.info(f"Memory cache hit for {sanitize_for_log(video_url)}")
             # Return cached response based on format
@@ -582,23 +673,8 @@ async def get_subtitles(
         )
 
         # Convert metadata to response model
-        metadata_response = VideoMetadataResponse(
-            video_id=metadata.video_id,
-            title=metadata.title,
-            description=metadata.description,
-            duration=metadata.duration,
-            duration_formatted=metadata.duration_formatted,
-            thumbnail=metadata.thumbnail,
-            channel=metadata.channel,
-            channel_id=metadata.channel_id,
-            upload_date=metadata.upload_date,
-            view_count=metadata.view_count,
-            like_count=metadata.like_count,
-            tags=metadata.tags,
-            categories=metadata.categories,
-            webpage_url=metadata.webpage_url,
-            extractor=metadata.extractor,
-        )
+        metadata_dict = metadata_to_response_dict(metadata)
+        metadata_response = VideoMetadataResponse(**metadata_dict)
 
         # Prepare response based on requested format
         response_data = None
@@ -614,7 +690,7 @@ async def get_subtitles(
             }
             # Cache the VTT content
             if settings.cache_enabled:
-                cache.set(video_url, lang, format.value, {"video_id": video_id, "vtt": subtitle_data})
+                await cache.set(video_url, lang, format.value, {"video_id": video_id, "vtt": subtitle_data})
                 # Persist to database with TTL
                 ttl_hours = settings.cache_ttl // 3600 or None
                 await db_engine.set_cached_subtitle(
@@ -637,7 +713,7 @@ async def get_subtitles(
             )
             # Cache the text response
             if settings.cache_enabled:
-                cache.set(video_url, lang, format.value, text_response.model_dump())
+                await cache.set(video_url, lang, format.value, text_response.model_dump())
                 # Persist to database with TTL
                 ttl_hours = settings.cache_ttl // 3600 or None
                 await db_engine.set_cached_subtitle(
@@ -660,7 +736,7 @@ async def get_subtitles(
             )
             # Cache the JSON response
             if settings.cache_enabled:
-                cache.set(video_url, lang, format.value, json_response.model_dump())
+                await cache.set(video_url, lang, format.value, json_response.model_dump())
                 # Persist to database with TTL
                 ttl_hours = settings.cache_ttl // 3600 or None
                 await db_engine.set_cached_subtitle(
@@ -706,8 +782,8 @@ async def list_languages(
 
     # Apply rate limiting if enabled
     if settings.rate_limit_enabled:
-        client_ip = get_remote_address(request)
-        if not _check_rate_limit(client_ip, settings.rate_limit_per_minute):
+        client_ip = get_remote_address_proxied(request)
+        if not await _check_rate_limit(client_ip, settings.rate_limit_per_minute):
             raise HTTPException(
                 status_code=429,
                 detail=f"Rate limit exceeded. Maximum {settings.rate_limit_per_minute} requests per minute.",
@@ -733,7 +809,7 @@ async def list_languages(
             video_id=video_id,
             languages=[LanguageInfo(**lang) for lang in languages],
         )
-    except ValueError as e:
+    except (ValueError, yt_dlp.utils.DownloadError) as e:
         raise HTTPException(status_code=404, detail=str(e))
 
 
@@ -769,10 +845,10 @@ async def batch_extract_subtitles(
 
     # Apply rate limiting (higher limit for batch)
     if settings.rate_limit_enabled:
-        client_ip = get_remote_address(request)
+        client_ip = get_remote_address_proxied(request)
         # Use 3x the normal limit for batch requests
         batch_limit = settings.rate_limit_per_minute * 3
-        if not _check_rate_limit(client_ip, batch_limit):
+        if not await _check_rate_limit(client_ip, batch_limit):
             raise HTTPException(
                 status_code=429,
                 detail=f"Rate limit exceeded. Maximum {batch_limit} requests per minute.",
@@ -815,7 +891,7 @@ async def batch_extract_subtitles(
                     continue
 
                 # Check in-memory cache
-                cached = cache.get(video_url, lang, format)
+                cached = await cache.get(video_url, lang, format)
                 if cached is not None:
                     results.append(
                         BatchResponseItem(
@@ -834,24 +910,8 @@ async def batch_extract_subtitles(
                 extractor.extract_subtitles, video_url, lang, format
             )
 
-            # Build metadata dict
-            metadata_dict = {
-                "video_id": metadata.video_id,
-                "title": metadata.title,
-                "description": metadata.description,
-                "duration": metadata.duration,
-                "duration_formatted": metadata.duration_formatted,
-                "thumbnail": metadata.thumbnail,
-                "channel": metadata.channel,
-                "channel_id": metadata.channel_id,
-                "upload_date": metadata.upload_date,
-                "view_count": metadata.view_count,
-                "like_count": metadata.like_count,
-                "tags": metadata.tags,
-                "categories": metadata.categories,
-                "webpage_url": metadata.webpage_url,
-                "extractor": metadata.extractor,
-            }
+            # Build metadata dict using helper
+            metadata_dict = metadata_to_response_dict(metadata)
 
             # Prepare response data
             if format == "json":
@@ -879,7 +939,7 @@ async def batch_extract_subtitles(
 
             # Cache result
             if settings.cache_enabled:
-                cache.set(video_url, lang, format, data)
+                await cache.set(video_url, lang, format, data)
                 # Persist to database with TTL
                 import json
                 ttl_hours = settings.cache_ttl // 3600 or None
@@ -907,7 +967,8 @@ async def batch_extract_subtitles(
 @app.get("/", summary="Simple health check")
 async def root() -> dict[str, str]:
     """Simple health check endpoint."""
-    return {"status": "healthy", "service": "ytdlp-microservice", "version": "0.2.0"}
+    from app import __version__
+    return {"status": "healthy", "service": "ytdlp-microservice", "version": __version__}
 
 
 @app.get("/health", response_model=HealthResponse, summary="Enhanced health check")
@@ -915,16 +976,21 @@ async def health() -> HealthResponse:
     """
     Enhanced health check with service metrics.
 
-    Returns service status, uptime, and cache statistics.
+    Returns service status, uptime, cache statistics, and database status.
     """
+    from app import __version__
     from app.config import settings
 
-    cache_stats = cache.get_stats() if settings.cache_enabled else {"enabled": False}
+    cache_stats = await cache.get_stats() if settings.cache_enabled else {"enabled": False}
+    db_status = await db_engine.health_check()
+
+    # Determine overall status
+    overall_status = "healthy" if db_status.get("status") == "healthy" else "degraded"
 
     return HealthResponse(
-        status="healthy",
+        status=overall_status,
         service="ytdlp-microservice",
-        version="0.2.0",
+        version=__version__,
         timestamp=time.time(),
         uptime_seconds=time.time() - _app_start_time,
         cache=cache_stats,
@@ -932,6 +998,7 @@ async def health() -> HealthResponse:
             "enabled": settings.rate_limit_enabled,
             "per_minute": settings.rate_limit_per_minute,
         },
+        database=db_status,
     )
 
 

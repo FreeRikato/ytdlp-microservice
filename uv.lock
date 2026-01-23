@@ -1006,6 +1006,15 @@ wheels = [
 ]
 
 [[package]]
+name = "structlog"
+version = "25.5.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/ef/52/9ba0f43b686e7f3ddfeaa78ac3af750292662284b3661e91ad5494f21dbc/structlog-25.5.0.tar.gz", hash = "sha256:098522a3bebed9153d4570c6d0288abf80a031dfdb2048d59a49e9dc2190fc98", size = 1460830, upload-time = "2025-10-27T08:28:23.028Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a8/45/a132b9074aa18e799b891b91ad72133c98d8042c70f6240e4c5f9dabee2f/structlog-25.5.0-py3-none-any.whl", hash = "sha256:a8453e9b9e636ec59bd9e79bbd4a72f025981b3ba0f5837aebf48f02f37a7f9f", size = 72510, upload-time = "2025-10-27T08:28:21.535Z" },
+]
+
+[[package]]
 name = "typing-extensions"
 version = "4.15.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1321,7 +1330,9 @@ dependencies = [
     { name = "nh3" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
+    { name = "slowapi" },
     { name = "sqlmodel" },
+    { name = "structlog" },
     { name = "uvicorn", extra = ["standard"] },
     { name = "yt-dlp", extra = ["curl-cffi", "default"] },
 ]
@@ -1331,6 +1342,15 @@ security = [
     { name = "slowapi" },
 ]
 test = [
+    { name = "httpx" },
+    { name = "pytest" },
+    { name = "pytest-asyncio" },
+    { name = "pytest-cov" },
+    { name = "pytest-mock" },
+]
+
+[package.dev-dependencies]
+dev = [
     { name = "httpx" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
@@ -1352,9 +1372,20 @@ requires-dist = [
     { name = "pytest-asyncio", marker = "extra == 'test'", specifier = ">=0.24.0" },
     { name = "pytest-cov", marker = "extra == 'test'", specifier = ">=5.0.0" },
     { name = "pytest-mock", marker = "extra == 'test'", specifier = ">=3.14.0" },
+    { name = "slowapi", specifier = ">=0.1.9" },
     { name = "slowapi", marker = "extra == 'security'", specifier = ">=0.1.9" },
     { name = "sqlmodel", specifier = ">=0.0.21" },
+    { name = "structlog", specifier = ">=24.0.0" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.32.0" },
     { name = "yt-dlp", extras = ["default", "curl-cffi"], specifier = ">=2024.12.6" },
 ]
 provides-extras = ["test", "security"]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "httpx", specifier = ">=0.28.1" },
+    { name = "pytest", specifier = ">=9.0.2" },
+    { name = "pytest-asyncio", specifier = ">=1.3.0" },
+    { name = "pytest-cov", specifier = ">=7.0.0" },
+    { name = "pytest-mock", specifier = ">=3.15.1" },
+]

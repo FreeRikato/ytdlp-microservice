@@ -5,10 +5,10 @@ This module provides an in-memory cache with TTL (time-to-live) support
 for caching subtitle extraction results to reduce load on YouTube's API.
 """
 
+import asyncio
 import hashlib
 import logging
 import time
-from threading import Lock
 from typing import Any
 
 from app.config import settings
@@ -24,7 +24,7 @@ class SubtitleCache:
     When the cache reaches maximum size, oldest entries are evicted first.
     Cache keys are generated as SHA-256 hashes of the request parameters.
 
-    Thread-safe: All cache operations are protected by a lock.
+    Async-safe: All cache operations are protected by a lock.
     """
 
     def __init__(self):
@@ -34,7 +34,7 @@ class SubtitleCache:
         self._misses = 0
         self.ttl = settings.cache_ttl
         self.maxsize = settings.cache_maxsize
-        self._lock = Lock()
+        self._lock = asyncio.Lock()
 
     def _generate_key(self, video_url: str, lang: str, format: str) -> str:
         """
@@ -51,7 +51,7 @@ class SubtitleCache:
         key_data = f"{video_url}:{lang}:{format}"
         return hashlib.sha256(key_data.encode()).hexdigest()
 
-    def get(self, video_url: str, lang: str, format: str) -> Any | None:
+    async def get(self, video_url: str, lang: str, format: str) -> Any | None:
         """
         Get cached subtitle data if available and not expired.
 
@@ -65,7 +65,7 @@ class SubtitleCache:
         """
         key = self._generate_key(video_url, lang, format)
 
-        with self._lock:
+        async with self._lock:
             if key not in self._cache:
                 self._misses += 1
                 return None
@@ -82,7 +82,7 @@ class SubtitleCache:
             logger.debug(f"Cache hit for key: {key[:8]}...")
             return data
 
-    def set(self, video_url: str, lang: str, format: str, data: Any) -> None:
+    async def set(self, video_url: str, lang: str, format: str, data: Any) -> None:
         """
         Cache subtitle data with current timestamp.
 
@@ -97,7 +97,7 @@ class SubtitleCache:
         """
         key = self._generate_key(video_url, lang, format)
 
-        with self._lock:
+        async with self._lock:
             # Evict oldest entry if at capacity and key is not already present
             if len(self._cache) >= self.maxsize and key not in self._cache:
                 oldest_key = min(self._cache, key=lambda k: self._cache[k][1])
@@ -107,21 +107,21 @@ class SubtitleCache:
             self._cache[key] = (data, time.time())
             logger.debug(f"Cache set for key: {key[:8]}...")
 
-    def clear(self) -> None:
+    async def clear(self) -> None:
         """Clear all cached data."""
-        with self._lock:
+        async with self._lock:
             size = len(self._cache)
             self._cache.clear()
             logger.info(f"Cache cleared: {size} entries removed")
 
-    def get_stats(self) -> dict[str, Any]:
+    async def get_stats(self) -> dict[str, Any]:
         """
         Get cache statistics.
 
         Returns:
             Dictionary with cache size, hits, misses, and hit rate
         """
-        with self._lock:
+        async with self._lock:
             total = self._hits + self._misses
             hit_rate = self._hits / total if total > 0 else 0
             return {
