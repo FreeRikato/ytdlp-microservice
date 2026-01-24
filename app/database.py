@@ -15,9 +15,9 @@ from typing import AsyncGenerator
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.pool import NullPool
 
-from sqlmodel import SQLModel
+from sqlmodel import SQLModel, select, delete, text
 
-from app.models import SubtitleCache, utcnow
+from app.models import SubtitleCache, utcnow, get_expires_at
 
 logger = logging.getLogger(__name__)
 
@@ -128,9 +128,6 @@ class DatabaseEngine:
         Returns:
             List of cache entries that have expired
         """
-        from sqlmodel import select
-        from app.models import SubtitleCache
-
         async with self.session_factory() as session:
             now = utcnow()
             result = await session.execute(
@@ -148,9 +145,6 @@ class DatabaseEngine:
         Returns:
             Number of entries deleted
         """
-        from sqlmodel import delete
-        from app.models import SubtitleCache
-
         async with self.session_factory() as session:
             now = utcnow()
             result = await session.execute(
@@ -179,9 +173,6 @@ class DatabaseEngine:
         Returns:
             SubtitleCache entry if found and not expired, None otherwise
         """
-        from sqlmodel import select
-        from app.models import SubtitleCache
-
         async with self.session_factory() as session:
             result = await session.execute(
                 select(SubtitleCache).where(
@@ -226,9 +217,6 @@ class DatabaseEngine:
         Returns:
             Created SubtitleCache entry
         """
-        from sqlmodel import select
-        from app.models import SubtitleCache, get_expires_at
-
         async with self.session_factory() as session:
             # Check for existing entry
             result = await session.execute(
@@ -273,7 +261,6 @@ class DatabaseEngine:
         try:
             async with self.session_factory() as session:
                 # Execute a simple query to check connectivity
-                from sqlmodel import text
                 await session.execute(text("SELECT 1"))
             return {"status": "healthy", "database": "connected"}
         except Exception as e:
@@ -352,9 +339,11 @@ class DatabaseLifecycle:
 
     async def start_background_cleanup(self) -> None:
         """Start the background cleanup task for expired cache entries."""
+        from app.config import settings
+
         self._shutdown_event = asyncio.Event()
-        # Use shorter poll interval for responsive shutdown (vs full cleanup interval)
-        poll_interval = 60  # Check shutdown every 60 seconds
+        # Use configurable poll interval from settings
+        poll_interval = settings.cache_poll_interval
 
         async def cleanup_loop():
             """Background task that periodically cleans up expired entries."""

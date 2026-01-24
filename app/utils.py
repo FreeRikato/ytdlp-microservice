@@ -15,14 +15,6 @@ YOUTUBE_PATTERN_COMPILED = re.compile(
 YOUTUBE_ID_PATTERN_COMPILED = re.compile(r"^([a-zA-Z0-9_-]{11})$")
 
 
-# YouTube video ID patterns - handles various URL formats including those
-# with additional query parameters (e.g., ?t=10, &list=xyz)
-YOUTUBE_PATTERNS = [
-    r"(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/embed/|youtube\.com/shorts/)([a-zA-Z0-9_-]{11})",
-    r"^([a-zA-Z0-9_-]{11})$",  # Raw video ID
-]
-
-
 def extract_video_id(url: str) -> str | None:
     """
     Extract video ID from a YouTube URL or return the input if it's a raw ID.

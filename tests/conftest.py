@@ -12,13 +12,23 @@ from app.main import app
 @pytest.fixture
 def client():
     """FastAPI TestClient for endpoint testing."""
+    from app.main import cache_manager
+
     # Mock rate limiting to always allow during tests
     with patch("app.main._check_rate_limit", return_value=True):
-        with patch("app.cache.cache.get", return_value=None):  # Disable cache for tests
-            # Mock database calls to avoid initialization issues
+        # Disable cache for tests by mocking the cache instance
+        original_cache = cache_manager._cache
+        cache_manager._cache = AsyncMock()
+        cache_manager._cache.get = AsyncMock(return_value=None)
+        cache_manager._cache.set = AsyncMock()
+        cache_manager._cache.get_stats = AsyncMock(return_value={"size": 0, "hits": 0, "misses": 0, "hit_rate": 0})
+        try:
             with patch("app.main.db_engine.get_cached_subtitle", new_callable=AsyncMock, return_value=None):
                 with patch("app.main.db_engine.set_cached_subtitle", new_callable=AsyncMock, return_value=None):
                     yield TestClient(app)
+        finally:
+            # Restore original cache
+            cache_manager._cache = original_cache
 
 
 @pytest.fixture

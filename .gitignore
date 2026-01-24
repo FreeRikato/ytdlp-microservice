@@ -21,3 +21,7 @@ temp/
 
 # Database files
 *.db
+
+# Coverage reports
+.coverage
+htmlcov/
