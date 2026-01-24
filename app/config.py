@@ -66,7 +66,7 @@ class Settings(BaseSettings):
 
     # Rate limiting
     rate_limit_enabled: bool = True
-    rate_limit_per_minute: int = 10
+    rate_limit_per_minute: int = 50
 
     # Security headers middleware
     enable_security_headers: bool = True

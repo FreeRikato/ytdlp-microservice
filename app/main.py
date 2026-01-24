@@ -261,14 +261,10 @@ def configure_middleware():
     # Add CORS middleware first (runs first in chain)
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=[
-            "chrome-extension://*",  # Allow all Chrome extensions
-            "http://localhost:*",
-            "http://127.0.0.1:*",
-        ],
+        allow_origins=["http://127.0.0.1:8000", "chrome-extension://*"],
+        allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
-        allow_credentials=True,
     )
     logger.info("CORS middleware enabled")
 
@@ -706,8 +702,16 @@ async def get_subtitles(
                 headers=response_data["headers"],
             )
         elif format == OutputFormat.text:
+            # Deduplicate subtitle entries by text content before joining
+            unique_entries = []
+            seen_texts = set()
+            for entry in cast(list[SubtitleEntry], subtitle_data):
+                if entry.text not in seen_texts:
+                    seen_texts.add(entry.text)
+                    unique_entries.append(entry)
+
             # Combine all subtitle text into single string
-            combined_text = " ".join(entry.text for entry in cast(list[SubtitleEntry], subtitle_data))
+            combined_text = " ".join(entry.text for entry in unique_entries)
             # Normalize whitespace
             combined_text = re.sub(r"\s+", " ", combined_text).strip()
             text_response = SubtitleTextResponse(

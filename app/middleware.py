@@ -44,7 +44,13 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
 
         # Content Security Policy - allow scripts for Swagger UI paths
         if request.url.path.startswith(("/docs", "/redoc", "/openapi")):
-            response.headers["Content-Security-Policy"] = "default-src 'self' 'unsafe-inline'"
+            response.headers["Content-Security-Policy"] = (
+                "default-src 'self' 'unsafe-inline'; "
+                "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+                "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+                "img-src 'self' https://fastapi.tiangolo.com; "
+                "connect-src 'self' https://cdn.jsdelivr.net"
+            )
         else:
             response.headers["Content-Security-Policy"] = "default-src 'self'"
 
