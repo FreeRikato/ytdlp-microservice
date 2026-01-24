@@ -14,8 +14,13 @@ DEFAULT_CACHE_TTL_HOURS = 24
 
 
 def utcnow() -> datetime:
-    """Return current UTC time as timezone-aware datetime."""
-    return datetime.now(timezone.utc)
+    """Return current UTC time as naive datetime for SQLite compatibility.
+
+    SQLite stores datetimes as strings without timezone info. When retrieved,
+    they become timezone-naive datetimes. Using naive datetimes consistently
+    prevents comparison errors between aware and naive datetimes.
+    """
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 def get_expires_at(ttl_hours: int = DEFAULT_CACHE_TTL_HOURS) -> datetime:
