@@ -32,6 +32,59 @@ from app.utils import extract_video_id
 logger = logging.getLogger(__name__)
 
 
+# ISO 639-1 language code to name mapping
+LANGUAGE_NAMES: dict[str, str] = {
+    "en": "English",
+    "es": "Spanish",
+    "fr": "French",
+    "de": "German",
+    "it": "Italian",
+    "pt": "Portuguese",
+    "ru": "Russian",
+    "ja": "Japanese",
+    "ko": "Korean",
+    "zh": "Chinese",
+    "zh-CN": "Chinese (Simplified)",
+    "zh-TW": "Chinese (Traditional)",
+    "ar": "Arabic",
+    "hi": "Hindi",
+    "tr": "Turkish",
+    "pl": "Polish",
+    "nl": "Dutch",
+    "sv": "Swedish",
+    "da": "Danish",
+    "fi": "Finnish",
+    "no": "Norwegian",
+    "id": "Indonesian",
+    "th": "Thai",
+    "vi": "Vietnamese",
+    "cs": "Czech",
+    "el": "Greek",
+    "he": "Hebrew",
+    "hu": "Hungarian",
+    "ro": "Romanian",
+    "uk": "Ukrainian",
+    "bg": "Bulgarian",
+    "hr": "Croatian",
+    "sk": "Slovak",
+    "sl": "Slovenian",
+    "lt": "Lithuanian",
+    "lv": "Latvian",
+    "et": "Estonian",
+    "ca": "Catalan",
+    "tl": "Tagalog",
+    "ml": "Malayalam",
+    "ta": "Tamil",
+    "te": "Telugu",
+    "bn": "Bengali",
+    "mr": "Marathi",
+    "ur": "Urdu",
+    "fa": "Persian",
+    "sw": "Swahili",
+    "am": "Amharic",
+}
+
+
 @dataclass
 class SubtitleEntry:
     """
@@ -46,6 +99,51 @@ class SubtitleEntry:
     start: str
     end: str
     text: str
+
+
+def vtt_to_srt_time(vtt_time: str) -> str:
+    """
+    Convert VTT timestamp format to SRT timestamp format.
+
+    VTT format: HH:MM:SS.mmm
+    SRT format: HH:MM:SS,mmm
+
+    Args:
+        vtt_time: Timestamp in VTT format
+
+    Returns:
+        Timestamp in SRT format
+    """
+    # Replace dot with comma for SRT format
+    return vtt_time.replace(".", ",", 1)
+
+
+def subtitle_to_srt(subtitles: list[SubtitleEntry]) -> str:
+    """
+    Convert subtitle entries to SRT format.
+
+    SRT format:
+    1
+    00:00:01,000 --> 00:00:04,000
+    Subtitle text here
+
+    2
+    00:00:05,000 --> 00:00:08,000
+    More subtitle text
+
+    Args:
+        subtitles: List of SubtitleEntry objects
+
+    Returns:
+        SRT formatted string
+    """
+    srt_parts = []
+    for idx, entry in enumerate(subtitles, start=1):
+        start_srt = vtt_to_srt_time(entry.start)
+        end_srt = vtt_to_srt_time(entry.end)
+        srt_parts.append(f"{idx}\n{start_srt} --> {end_srt}\n{entry.text}")
+
+    return "\n\n".join(srt_parts) + "\n"
 
 
 @dataclass
@@ -146,11 +244,12 @@ class SubtitleExtractor:
     # VTT timestamp pattern: HH:MM:SS.mmm --> HH:MM:SS.mmm
     # Also handles MM:SS.mmm format for shorter videos
     # Uses \d+ for hours to handle videos of any length (including >99 hours)
+    # \d+ after decimal allows variable precision (e.g., .3, .30, .300)
     TIMESTAMP_PATTERN = re.compile(
-        r"(\d+:\d{2}:\d{2}\.\d{3})\s*-->\s*(\d+:\d{2}:\d{2}\.\d{3})"
+        r"(\d+:\d{2}:\d{2}\.\d+)\s*-->\s*(\d+:\d{2}:\d{2}\.\d+)"
     )
     TIMESTAMP_PATTERN_SHORT = re.compile(
-        r"(\d{2}:\d{2}\.\d{3})\s*-->\s*(\d{2}:\d{2}\.\d{3})"
+        r"(\d{2}:\d{2}\.\d+)\s*-->\s*(\d{2}:\d{2}\.\d+)"
     )
 
     # Pattern to remove all HTML/XML-style tags from subtitle text
@@ -221,6 +320,8 @@ class SubtitleExtractor:
             "quiet": False,
             "no_warnings": False,
             "logger": logger,
+            # Request timeout for yt-dlp operations
+            "socket_timeout": self.config.ytdlp_request_timeout,
         }
 
     def _parse_vtt_to_json(self, vtt_content: str) -> list[SubtitleEntry]:
@@ -403,7 +504,7 @@ class SubtitleExtractor:
                 formats = [s.get("ext", "vtt") for s in subs_list] if isinstance(subs_list, list) else ["vtt"]
                 languages.append({
                     "code": lang_code,
-                    "name": lang_code,  # Could enhance with language name mapping
+                    "name": LANGUAGE_NAMES.get(lang_code, lang_code),
                     "auto_generated": False,
                     "formats": formats,
                 })
@@ -414,7 +515,7 @@ class SubtitleExtractor:
                     formats = [s.get("ext", "vtt") for s in subs_list] if isinstance(subs_list, list) else ["vtt"]
                     languages.append({
                         "code": lang_code,
-                        "name": lang_code,
+                        "name": LANGUAGE_NAMES.get(lang_code, lang_code),
                         "auto_generated": True,
                         "formats": formats,
                     })

@@ -77,7 +77,8 @@ class Settings(BaseSettings):
     cache_enabled: bool = True
     cache_ttl: int = 3600  # 1 hour in seconds
     cache_maxsize: int = 1000  # Maximum number of cached entries
-    redis_url: str | None = None  # Optional Redis backend for future use
+    cache_poll_interval: int = 60  # Background cleanup poll interval in seconds
+    redis_url: str | None = None  # Redis backend URL (e.g., redis://localhost:6379/0)
 
     # ========== Database Settings ==========
 

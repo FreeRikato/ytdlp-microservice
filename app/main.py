@@ -6,6 +6,8 @@ YouTube videos with anti-bot detection strategies.
 """
 
 import asyncio
+import inspect
+import json
 import logging
 import re
 import time
@@ -16,33 +18,28 @@ from contextvars import ContextVar
 from enum import Enum
 from typing import TYPE_CHECKING, cast
 
+import structlog
 import yt_dlp
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
 from starlette.middleware.base import BaseHTTPMiddleware
 from structlog.contextvars import bind_contextvars, clear_contextvars
 
 if TYPE_CHECKING:
     from app.service import VideoMetadata
 
+# Local imports
+from app.cache import CacheProtocol, RedisCache, SubtitleCache
+from app.config import settings
+from app.database import db_engine, db_lifecycle
 from app.service import SubtitleEntry, get_extractor
 from app.utils import is_valid_youtube_url
 
-# Caching
-from app.cache import cache
-
-# Rate limiting
-from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.errors import RateLimitExceeded
-
-# Import database lifecycle for startup/shutdown
-from app.database import db_lifecycle, db_engine
-
 # Configure logging with request ID context
-import structlog
-
 structlog.configure(
     processors=[
         structlog.contextvars.merge_contextvars,
@@ -56,6 +53,68 @@ structlog.configure(
     cache_logger_on_first_use=True,
 )
 logger = structlog.get_logger()
+
+
+# Cache manager for handling cache lifecycle
+class CacheManager:
+    """Manages cache instance with Redis support."""
+
+    def __init__(self):
+        self._cache: CacheProtocol = SubtitleCache()  # Default to in-memory cache
+        self._redis_connected = False
+
+    @property
+    def cache(self) -> CacheProtocol:
+        """Get the current cache instance."""
+        return self._cache
+
+    async def startup(self) -> None:
+        """Initialize cache and connect to Redis if configured."""
+        if settings.redis_url:
+            try:
+                redis_cache = RedisCache()
+                await redis_cache.connect()
+                self._cache = redis_cache
+                self._redis_connected = True
+                logger.info(f"Connected to Redis at {settings.redis_url}")
+            except Exception as e:
+                logger.error(f"Failed to connect to Redis: {e}")
+                logger.warning("Falling back to in-memory cache")
+                self._cache = SubtitleCache()
+
+    async def shutdown(self) -> None:
+        """Disconnect from Redis if connected."""
+        if self._redis_connected:
+            try:
+                await self._cache.disconnect()
+                logger.info("Disconnected from Redis")
+            except Exception as e:
+                logger.error(f"Error disconnecting from Redis: {e}")
+
+
+# Global cache manager
+cache_manager = CacheManager()
+
+# For backwards compatibility, expose cache at module level
+# This property ensures cache is always available
+class _CacheProxy:
+    """Proxy to cache_manager.cache for backwards compatibility."""
+
+    def __getattr__(self, name):
+        attr = getattr(cache_manager.cache, name)
+        # Check if it's a coroutine function (async method)
+        if inspect.iscoroutinefunction(attr):
+            async def wrapper(*args, **kwargs):
+                return await attr(*args, **kwargs)
+            return wrapper
+        return attr
+
+    def __setattr__(self, name, value):
+        setattr(cache_manager.cache, name, value)
+
+
+cache = _CacheProxy()
+
 
 # Request ID context variable
 request_id_var: ContextVar[str] = ContextVar("request_id", default="")
@@ -177,8 +236,6 @@ def metadata_to_response_dict(metadata: "VideoMetadata") -> dict:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage application lifespan events."""
-    from app.config import settings
-
     # Startup
     logger.info("=" * 60)
     logger.info("YouTube Subtitle Microservice Starting")
@@ -195,6 +252,10 @@ async def lifespan(app: FastAPI):
     logger.info(f"  - Caching: {'enabled' if settings.cache_enabled else 'disabled'}")
     logger.info(f"  - TTL: {settings.cache_ttl}s")
     logger.info(f"  - Max Size: {settings.cache_maxsize} entries")
+    if settings.redis_url:
+        logger.info(f"  - Redis: {settings.redis_url}")
+    else:
+        logger.info("  - Redis: disabled (using in-memory cache)")
     logger.info("Database:")
     logger.info("  - Type: SQLite (async with sqlmodel)")
     logger.info(f"  - File: {settings.database_path}")
@@ -207,7 +268,19 @@ async def lifespan(app: FastAPI):
         logger.error(f"Failed to initialize database: {e}")
         raise
 
+    # Initialize cache (including Redis connection if configured)
+    try:
+        await cache_manager.startup()
+    except Exception as e:
+        logger.error(f"Failed to initialize cache: {e}")
+
     yield
+
+    # Shutdown cache (including Redis disconnect)
+    try:
+        await cache_manager.shutdown()
+    except Exception as e:
+        logger.error(f"Error during cache shutdown: {e}")
 
     # Shutdown database
     try:
@@ -254,7 +327,6 @@ class RequestIdMiddleware(BaseHTTPMiddleware):
 
 def configure_middleware():
     """Configure middleware based on settings."""
-    from app.config import settings
     from app.middleware import SecurityHeadersMiddleware
     from fastapi.middleware.cors import CORSMiddleware
 
@@ -395,6 +467,7 @@ class OutputFormat(str, Enum):
     json = "json"
     vtt = "vtt"
     text = "text"
+    srt = "srt"
 
 
 # ============================================================================
@@ -471,8 +544,6 @@ async def download_error_handler(request: Request, exc: yt_dlp.utils.DownloadErr
         503 Service Unavailable for HTTP Error 429
         500 Internal Server Error for other download errors
     """
-    from app.config import settings
-
     error_msg = str(exc)
 
     # Check specifically for HTTP 429 - rate limit error
@@ -601,8 +672,6 @@ async def get_subtitles(
     - 429: Too many requests (rate limit exceeded)
     - 503: YouTube rate limit detected (retry after 60 seconds)
     """
-    from app.config import settings
-
     # Apply rate limiting if enabled
     if settings.rate_limit_enabled:
         client_ip = get_remote_address_proxied(request)
@@ -636,6 +705,18 @@ async def get_subtitles(
                         "X-Cache": "HIT",
                     },
                 )
+            elif format == OutputFormat.srt:
+                # SRT format caches as {"video_id": ..., "srt": "..."}
+                srt_data = json.loads(cached_data)
+                return PlainTextResponse(
+                    content=srt_data["srt"],
+                    headers={
+                        "Content-Type": "text/plain; charset=utf-8",
+                        "X-Video-ID": srt_data.get("video_id", db_entry.video_id),
+                        "X-Cache": "HIT",
+                        "Content-Disposition": "attachment; filename=subtitles.srt",
+                    },
+                )
             elif format == OutputFormat.text:
                 return SubtitleTextResponse.model_validate_json(cached_data)
             else:
@@ -654,6 +735,17 @@ async def get_subtitles(
                         "Content-Type": "text/vtt; charset=utf-8",
                         "X-Video-ID": cached_data.get("video_id", ""),
                         "X-Cache": "HIT",
+                    },
+                )
+            elif format == OutputFormat.srt:
+                # SRT format caches as {"video_id": ..., "srt": "..."}
+                return PlainTextResponse(
+                    content=cast(str, cached_data["srt"]),
+                    headers={
+                        "Content-Type": "text/plain; charset=utf-8",
+                        "X-Video-ID": cached_data.get("video_id", ""),
+                        "X-Cache": "HIT",
+                        "Content-Disposition": "attachment; filename=subtitles.srt",
                     },
                 )
             elif format == OutputFormat.text:
@@ -729,6 +821,30 @@ async def get_subtitles(
                     video_url, video_id, lang, format.value, text_response.model_dump_json(), ttl_hours=ttl_hours
                 )
             return text_response
+        elif format == OutputFormat.srt:
+            # Convert subtitles to SRT format
+            from app.service import subtitle_to_srt
+
+            srt_content = subtitle_to_srt(cast(list[SubtitleEntry], subtitle_data))
+            srt_response = PlainTextResponse(
+                content=srt_content,
+                headers={
+                    "Content-Type": "text/plain; charset=utf-8",
+                    "X-Video-ID": video_id,
+                    "X-Cache": "MISS",
+                    "Content-Disposition": "attachment; filename=subtitles.srt",
+                },
+            )
+            # Cache the SRT response (store as dict for consistency with VTT format)
+            srt_data = {"video_id": video_id, "srt": srt_content}
+            if settings.cache_enabled:
+                await cache.set(video_url, lang, format.value, srt_data)
+                # Persist to database with TTL
+                ttl_hours = settings.cache_ttl // 3600 or None
+                await db_engine.set_cached_subtitle(
+                    video_url, video_id, lang, format.value, json.dumps(srt_data), ttl_hours=ttl_hours
+                )
+            return srt_response
         else:
             # Convert SubtitleEntry objects to Pydantic models (json format with timestamps)
             subtitle_models = [
@@ -787,8 +903,6 @@ async def list_languages(
     curl "http://localhost:8000/api/v1/subtitles/languages?video_url=dQw4w9WgXcQ"
     ```
     """
-    from app.config import settings
-
     # Apply rate limiting if enabled
     if settings.rate_limit_enabled:
         client_ip = get_remote_address_proxied(request)
@@ -850,8 +964,6 @@ async def batch_extract_subtitles(
       -d '{"videos": [{"video_url": "dQw4w9WgXcQ", "lang": "en", "format": "json"}]}'
     ```
     """
-    from app.config import settings
-
     # Apply rate limiting (higher limit for batch)
     if settings.rate_limit_enabled:
         client_ip = get_remote_address_proxied(request)
@@ -887,7 +999,6 @@ async def batch_extract_subtitles(
                 if db_entry is not None:
                     cached = db_entry.subtitle_data
                     # Parse from JSON to dict
-                    import json
                     cached_dict = json.loads(cached)
                     results.append(
                         BatchResponseItem(
@@ -943,6 +1054,11 @@ async def batch_extract_subtitles(
                     "text": combined,
                     "metadata": metadata_dict,
                 }
+            elif format == "srt":
+                from app.service import subtitle_to_srt
+
+                srt_content = subtitle_to_srt(subtitle_data)
+                data = {"video_id": video_id, "srt": srt_content}
             else:  # vtt
                 data = {"video_id": video_id, "vtt": subtitle_data}
 
@@ -950,7 +1066,6 @@ async def batch_extract_subtitles(
             if settings.cache_enabled:
                 await cache.set(video_url, lang, format, data)
                 # Persist to database with TTL
-                import json
                 ttl_hours = settings.cache_ttl // 3600 or None
                 await db_engine.set_cached_subtitle(
                     video_url, video_id, lang, format, json.dumps(data), ttl_hours=ttl_hours
@@ -962,11 +1077,27 @@ async def batch_extract_subtitles(
                 )
             )
 
-        except Exception as e:
-            logger.error(f"Batch extraction error for {video_url}: {e}")
+        except yt_dlp.utils.DownloadError as e:
+            # yt-dlp specific download errors (e.g., 429 rate limiting, video not found)
+            logger.warning(f"Download error for {video_url}: {e}")
             results.append(
                 BatchResponseItem(
-                    video_url=video_url, success=False, error=str(e)[:200]
+                    video_url=video_url, success=False, error=f"Download failed: {str(e)[:200]}"
+                )
+            )
+        except ValueError as e:
+            # Validation errors (e.g., invalid URL, no subtitles found)
+            logger.warning(f"Validation error for {video_url}: {e}")
+            results.append(
+                BatchResponseItem(
+                    video_url=video_url, success=False, error=f"Validation error: {str(e)[:200]}"
+                )
+            )
+        except Exception as e:
+            logger.exception(f"Unexpected error during batch extraction for {video_url}: {e}")
+            results.append(
+                BatchResponseItem(
+                    video_url=video_url, success=False, error=f"Unexpected error: {str(e)[:200]}"
                 )
             )
 
@@ -988,7 +1119,6 @@ async def health() -> HealthResponse:
     Returns service status, uptime, cache statistics, and database status.
     """
     from app import __version__
-    from app.config import settings
 
     cache_stats = await cache.get_stats() if settings.cache_enabled else {"enabled": False}
     db_status = await db_engine.health_check()
