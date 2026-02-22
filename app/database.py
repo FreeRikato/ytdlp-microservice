@@ -13,7 +13,8 @@ from pathlib import Path
 from typing import AsyncGenerator
 
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
-from sqlalchemy.pool import NullPool
+from sqlalchemy.dialects.sqlite import insert
+from sqlalchemy.pool import NullPool, AsyncAdaptedQueuePool
 
 from sqlmodel import SQLModel, select, delete, text
 
@@ -84,7 +85,9 @@ class DatabaseEngine:
                         self.database_url,
                         echo=self._echo,
                         connect_args={"check_same_thread": False},
-                        poolclass=NullPool,  # Better for SQLite
+                        poolclass=AsyncAdaptedQueuePool,
+                        pool_size=5,
+                        max_overflow=10,
                         isolation_level="autocommit",  # Reduces locking issues with concurrent writes
                     )
                     logger.info(f"Created async database engine: {self.database_url}")
@@ -206,6 +209,8 @@ class DatabaseEngine:
         """
         Store a subtitle entry in the database cache.
 
+        Uses SQLite UPSERT (INSERT OR REPLACE) for atomic insert/update operation.
+
         Args:
             video_url: YouTube video URL or ID
             video_id: YouTube video ID
@@ -215,10 +220,41 @@ class DatabaseEngine:
             ttl_hours: Time-to-live in hours (uses DEFAULT_CACHE_TTL_HOURS if None)
 
         Returns:
-            Created SubtitleCache entry
+            Created or updated SubtitleCache entry
         """
+        from sqlalchemy import func
+
+        expires_at = get_expires_at(ttl_hours) if ttl_hours else None
+        now = utcnow()
+
         async with self.session_factory() as session:
-            # Check for existing entry
+            # Use SQLite UPSERT: INSERT ON CONFLICT DO UPDATE
+            # This is atomic and avoids the SELECT + INSERT/UPDATE pattern
+            stmt = (
+                insert(SubtitleCache)
+                .values(
+                    video_url=video_url,
+                    video_id=video_id,
+                    language=language,
+                    output_format=output_format,
+                    subtitle_data=subtitle_data,
+                    created_at=now,
+                    expires_at=expires_at,
+                )
+                .on_conflict_do_update(
+                    index_elements=["video_url", "language", "output_format"],
+                    set_={
+                        "video_id": video_id,
+                        "subtitle_data": subtitle_data,
+                        "created_at": now,
+                        "expires_at": expires_at,
+                    },
+                )
+            )
+            await session.execute(stmt)
+            await session.commit()
+
+            # Return the upserted entry
             result = await session.execute(
                 select(SubtitleCache).where(
                     SubtitleCache.video_url == video_url,
@@ -226,30 +262,7 @@ class DatabaseEngine:
                     SubtitleCache.output_format == output_format,
                 )
             )
-            existing = result.scalars().first()
-
-            expires_at = get_expires_at(ttl_hours) if ttl_hours else None
-
-            if existing:
-                # Update existing entry
-                existing.subtitle_data = subtitle_data
-                existing.expires_at = expires_at
-                await session.commit()
-                return existing
-
-            # Create new entry
-            entry = SubtitleCache(
-                video_url=video_url,
-                video_id=video_id,
-                language=language,
-                output_format=output_format,
-                subtitle_data=subtitle_data,
-                expires_at=expires_at,
-            )
-            session.add(entry)
-            await session.commit()
-            await session.refresh(entry)
-            return entry
+            return result.scalars().first()
 
     async def health_check(self) -> dict[str, str]:
         """

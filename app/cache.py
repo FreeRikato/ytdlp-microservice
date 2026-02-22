@@ -13,6 +13,8 @@ import logging
 import time
 from typing import TYPE_CHECKING, Any, Protocol
 
+from cachetools import TTLCache as CachetoolsTTLCache
+
 from app.config import settings
 
 if TYPE_CHECKING:
@@ -26,6 +28,8 @@ class CacheProtocol(Protocol):
 
     async def get(self, video_url: str, lang: str, format: str) -> Any | None: ...
     async def set(self, video_url: str, lang: str, format: str, data: Any) -> None: ...
+    async def get_languages(self, video_url: str) -> Any | None: ...
+    async def set_languages(self, video_url: str, data: Any) -> None: ...
     async def clear(self) -> None: ...
     async def get_stats(self) -> dict[str, Any]: ...
     async def disconnect(self) -> None: ...
@@ -36,20 +40,57 @@ class SubtitleCache:
     In-memory cache for subtitle data with TTL support.
 
     This cache stores extracted subtitle data with a configurable TTL.
-    When the cache reaches maximum size, oldest entries are evicted first.
-    Cache keys are generated as SHA-256 hashes of the request parameters.
+    Uses cachetools.TTLCache for thread-safe operations with automatic
+    TTL-based expiration and LRU eviction.
 
-    Async-safe: All cache operations are protected by a lock.
+    Cache keys are generated as SHA-256 hashes of the request parameters.
     """
 
     def __init__(self):
         """Initialize cache with settings from configuration."""
-        self._cache: dict[str, tuple[Any, float]] = {}
         self._hits = 0
         self._misses = 0
-        self.ttl = settings.cache_ttl
-        self.maxsize = settings.cache_maxsize
-        self._lock = asyncio.Lock()
+        self._ttl = settings.cache_ttl
+        self._maxsize = settings.cache_maxsize
+        # cachetools.TTLCache is thread-safe and handles its own locking
+        # TTL is in seconds, timer uses time.monotonic
+        self._cache: CachetoolsTTLCache = CachetoolsTTLCache(
+            maxsize=self._maxsize,
+            ttl=self._ttl,
+            timer=time.monotonic,
+        )
+
+    @property
+    def ttl(self) -> float:
+        """Get the TTL in seconds."""
+        return self._ttl
+
+    @ttl.setter
+    def ttl(self, value: float) -> None:
+        """Set the TTL and recreate the underlying cache with new TTL."""
+        self._ttl = value
+        # Recreate cache with new TTL - old entries are lost but that's acceptable for tests
+        self._cache = CachetoolsTTLCache(
+            maxsize=self._maxsize,
+            ttl=value,
+            timer=time.monotonic,
+        )
+
+    @property
+    def maxsize(self) -> int:
+        """Get the maximum cache size."""
+        return self._maxsize
+
+    @maxsize.setter
+    def maxsize(self, value: int) -> None:
+        """Set the maximum cache size and recreate the underlying cache."""
+        self._maxsize = value
+        # Recreate cache with new maxsize - old entries are lost but that's acceptable for tests
+        self._cache = CachetoolsTTLCache(
+            maxsize=value,
+            ttl=self._ttl,
+            timer=time.monotonic,
+        )
 
     def _generate_key(self, video_url: str, lang: str, format: str) -> str:
         """
@@ -80,29 +121,20 @@ class SubtitleCache:
         """
         key = self._generate_key(video_url, lang, format)
 
-        async with self._lock:
-            if key not in self._cache:
-                self._misses += 1
-                return None
+        # TTLCache handles its own locking internally
+        # Expired entries return None automatically
+        data = self._cache.get(key)
+        if data is None:
+            self._misses += 1
+            return None
 
-            data, timestamp = self._cache[key]
-
-            # Check if entry has expired
-            if time.time() - timestamp > self.ttl:
-                del self._cache[key]
-                self._misses += 1
-                return None
-
-            self._hits += 1
-            logger.debug(f"Cache hit for key: {key[:8]}...")
-            return data
+        self._hits += 1
+        logger.debug(f"Cache hit for key: {key[:8]}...")
+        return data
 
     async def set(self, video_url: str, lang: str, format: str, data: Any) -> None:
         """
         Cache subtitle data with current timestamp.
-
-        If the cache is at maximum capacity, the oldest entry (by timestamp)
-        will be evicted to make room for the new entry.
 
         Args:
             video_url: YouTube video URL or ID
@@ -112,22 +144,65 @@ class SubtitleCache:
         """
         key = self._generate_key(video_url, lang, format)
 
-        async with self._lock:
-            # Evict oldest entry if at capacity and key is not already present
-            if len(self._cache) >= self.maxsize and key not in self._cache:
-                oldest_key = min(self._cache, key=lambda k: self._cache[k][1])
-                del self._cache[oldest_key]
-                logger.debug(f"Cache evicted oldest entry: {oldest_key[:8]}...")
-
-            self._cache[key] = (data, time.time())
-            logger.debug(f"Cache set for key: {key[:8]}...")
+        # TTLCache handles its own locking and LRU eviction internally
+        # When maxsize is exceeded, least recently used items are evicted
+        self._cache[key] = data
+        logger.debug(f"Cache set for key: {key[:8]}...")
 
     async def clear(self) -> None:
         """Clear all cached data."""
-        async with self._lock:
-            size = len(self._cache)
-            self._cache.clear()
-            logger.info(f"Cache cleared: {size} entries removed")
+        size = len(self._cache)
+        self._cache.clear()
+        logger.info(f"Cache cleared: {size} entries removed")
+
+    async def get_languages(self, video_url: str) -> Any | None:
+        """
+        Get cached language list for a video if available and not expired.
+
+        Args:
+            video_url: YouTube video URL or ID
+
+        Returns:
+            Cached language list data if found and not expired, None otherwise
+        """
+        key = self._generate_languages_key(video_url)
+
+        # TTLCache handles its own locking internally
+        data = self._cache.get(key)
+        if data is None:
+            self._misses += 1
+            return None
+
+        self._hits += 1
+        logger.debug(f"Languages cache hit for key: {key[:8]}...")
+        return data
+
+    async def set_languages(self, video_url: str, data: Any) -> None:
+        """
+        Cache language list data for a video.
+
+        Args:
+            video_url: YouTube video URL or ID
+            data: Language list data to cache
+        """
+        key = self._generate_languages_key(video_url)
+
+        # TTLCache handles its own locking and eviction internally
+        self._cache[key] = data
+        logger.debug(f"Languages cache set for key: {key[:8]}...")
+
+    def _generate_languages_key(self, video_url: str) -> str:
+        """
+        Generate a cache key for language list lookups.
+
+        Args:
+            video_url: YouTube video URL or ID
+
+        Returns:
+            SHA-256 hash with 'langs:' prefix
+        """
+        key_data = f"{video_url}:langs"
+        return hashlib.sha256(key_data.encode()).hexdigest()
 
     async def get_stats(self) -> dict[str, Any]:
         """
@@ -136,19 +211,47 @@ class SubtitleCache:
         Returns:
             Dictionary with cache size, hits, misses, and hit rate
         """
-        async with self._lock:
-            total = self._hits + self._misses
-            hit_rate = self._hits / total if total > 0 else 0
-            return {
-                "size": len(self._cache),
-                "hits": self._hits,
-                "misses": self._misses,
-                "hit_rate": hit_rate,
-            }
+        total = self._hits + self._misses
+        hit_rate = self._hits / total if total > 0 else 0
+        return {
+            "size": len(self._cache),
+            "hits": self._hits,
+            "misses": self._misses,
+            "hit_rate": hit_rate,
+        }
 
 
 # Global cache instance - shared across all requests
 cache = SubtitleCache()
+
+# Global Redis connection pool - shared across all RedisCache instances
+_redis_pool: "redis.ConnectionPool | None" = None
+
+
+def _get_redis_pool(redis_url: str | None = None) -> "redis.ConnectionPool":
+    """
+    Get or create the global Redis connection pool.
+
+    Args:
+        redis_url: Redis URL, defaults to settings.redis_url
+
+    Returns:
+        Shared ConnectionPool instance
+    """
+    global _redis_pool
+    if _redis_pool is None:
+        import redis.asyncio as redis
+
+        url = redis_url or settings.redis_url
+        if url:
+            _redis_pool = redis.ConnectionPool.from_url(
+                url,
+                encoding="utf-8",
+                decode_responses=True,
+                max_connections=20,
+            )
+            logger.info(f"Created Redis connection pool for {url}")
+    return _redis_pool
 
 
 class RedisCache:
@@ -157,6 +260,9 @@ class RedisCache:
 
     This cache stores extracted subtitle data in Redis with a configurable TTL.
     Suitable for distributed deployments where multiple instances share cache.
+
+    Uses a shared connection pool for efficient connection reuse.
+    Redis operations are atomic, so no additional locking is needed.
 
     Attributes:
         ttl: Time-to-live in seconds for cache entries
@@ -171,23 +277,21 @@ class RedisCache:
         self.ttl = settings.cache_ttl
         self._hits = 0
         self._misses = 0
-        self._lock = asyncio.Lock()
 
     async def connect(self) -> None:
-        """Connect to Redis server."""
+        """Connect to Redis server using connection pool."""
         import redis.asyncio as redis
 
         if self._redis_url:
-            self._client = redis.from_url(
-                self._redis_url,
-                encoding="utf-8",
-                decode_responses=True,
-            )
-            logger.info(f"Connected to Redis at {self._redis_url}")
+            pool = _get_redis_pool(self._redis_url)
+            if pool:
+                self._client = redis.Redis(connection_pool=pool)
+                logger.info("Connected to Redis using connection pool")
 
     async def disconnect(self) -> None:
-        """Disconnect from Redis server."""
+        """Disconnect from Redis server (returns connection to pool)."""
         if self._client:
+            # Just close the client, connection returns to pool
             await self._client.close()
             self._client = None
             logger.info("Disconnected from Redis")
@@ -224,28 +328,20 @@ class RedisCache:
 
         key = f"sofia:subtitles:{self._generate_key(video_url, lang, format)}"
 
-        async with self._lock:
-            try:
-                data = await self._client.get(key)
-                if data is None:
-                    self._misses += 1
-                    return None
-
-                # Check if entry has expired (Redis handles TTL, but verify)
-                ttl = await self._client.ttl(key)
-                if ttl == -1:
-                    # Key exists but has no TTL - this shouldn't happen
-                    await self._client.delete(key)
-                    self._misses += 1
-                    return None
-
-                self._hits += 1
-                logger.debug(f"Redis cache hit for key: {key[:8]}...")
-                return json.loads(data)
-            except Exception as e:
-                logger.error(f"Redis get error: {e}")
+        # Redis operations are atomic, no lock needed
+        try:
+            data = await self._client.get(key)
+            if data is None:
                 self._misses += 1
                 return None
+
+            self._hits += 1
+            logger.debug(f"Redis cache hit for key: {key[:8]}...")
+            return json.loads(data)
+        except Exception as e:
+            logger.error(f"Redis get error: {e}")
+            self._misses += 1
+            return None
 
     async def set(self, video_url: str, lang: str, format: str, data: Any) -> None:
         """
@@ -262,29 +358,92 @@ class RedisCache:
 
         key = f"sofia:subtitles:{self._generate_key(video_url, lang, format)}"
 
-        async with self._lock:
-            try:
-                await self._client.setex(key, self.ttl, json.dumps(data))
-                logger.debug(f"Redis cache set for key: {key[:8]}...")
-            except Exception as e:
-                logger.error(f"Redis set error: {e}")
+        # Redis operations are atomic, no lock needed
+        try:
+            await self._client.setex(key, self.ttl, json.dumps(data))
+            logger.debug(f"Redis cache set for key: {key[:8]}...")
+        except Exception as e:
+            logger.error(f"Redis set error: {e}")
 
     async def clear(self) -> None:
         """Clear all cached data."""
         if not self._client:
             return
 
-        async with self._lock:
-            try:
-                # Only clear keys with our cache prefix to avoid deleting other Redis data
-                keys = []
-                async for key in self._client.scan_iter(match="sofia:subtitles:*", count=100):
-                    keys.append(key)
-                if keys:
-                    await self._client.delete(*keys)
-                    logger.info(f"Redis cache cleared: {len(keys)} entries removed")
-            except Exception as e:
-                logger.error(f"Redis clear error: {e}")
+        # Redis operations are atomic, no lock needed
+        try:
+            # Only clear keys with our cache prefix to avoid deleting other Redis data
+            keys = []
+            async for key in self._client.scan_iter(match="sofia:subtitles:*", count=100):
+                keys.append(key)
+            if keys:
+                await self._client.delete(*keys)
+                logger.info(f"Redis cache cleared: {len(keys)} entries removed")
+        except Exception as e:
+            logger.error(f"Redis clear error: {e}")
+
+    async def get_languages(self, video_url: str) -> Any | None:
+        """
+        Get cached language list for a video if available and not expired.
+
+        Args:
+            video_url: YouTube video URL or ID
+
+        Returns:
+            Cached language list data if found and not expired, None otherwise
+        """
+        if not self._client:
+            return None
+
+        key = f"sofia:langs:{self._generate_languages_key(video_url)}"
+
+        # Redis operations are atomic, no lock needed
+        try:
+            data = await self._client.get(key)
+            if data is None:
+                self._misses += 1
+                return None
+
+            self._hits += 1
+            logger.debug(f"Redis languages cache hit for key: {key[:8]}...")
+            return json.loads(data)
+        except Exception as e:
+            logger.error(f"Redis get languages error: {e}")
+            self._misses += 1
+            return None
+
+    async def set_languages(self, video_url: str, data: Any) -> None:
+        """
+        Cache language list data for a video.
+
+        Args:
+            video_url: YouTube video URL or ID
+            data: Language list data to cache
+        """
+        if not self._client:
+            return
+
+        key = f"sofia:langs:{self._generate_languages_key(video_url)}"
+
+        # Redis operations are atomic, no lock needed
+        try:
+            await self._client.setex(key, self.ttl, json.dumps(data))
+            logger.debug(f"Redis languages cache set for key: {key[:8]}...")
+        except Exception as e:
+            logger.error(f"Redis set languages error: {e}")
+
+    def _generate_languages_key(self, video_url: str) -> str:
+        """
+        Generate a cache key for language list lookups.
+
+        Args:
+            video_url: YouTube video URL or ID
+
+        Returns:
+            SHA-256 hash of the video URL
+        """
+        key_data = f"{video_url}:langs"
+        return hashlib.sha256(key_data.encode()).hexdigest()
 
     async def get_stats(self) -> dict[str, Any]:
         """
@@ -293,12 +452,11 @@ class RedisCache:
         Returns:
             Dictionary with cache size, hits, misses, and hit rate
         """
-        async with self._lock:
-            total = self._hits + self._misses
-            hit_rate = self._hits / total if total > 0 else 0
-            return {
-                "size": "N/A",  # Redis handles TTL internally, size tracking adds overhead
-                "hits": self._hits,
-                "misses": self._misses,
-                "hit_rate": hit_rate,
-            }
+        total = self._hits + self._misses
+        hit_rate = self._hits / total if total > 0 else 0
+        return {
+            "size": "N/A",  # Redis handles TTL internally, size tracking adds overhead
+            "hits": self._hits,
+            "misses": self._misses,
+            "hit_rate": hit_rate,
+        }

@@ -33,7 +33,7 @@ class Settings(BaseSettings):
             Must be writable. Files are cleaned up after each request.
         REQUEST_TIMEOUT: Request timeout in seconds (default: 120)
         RATE_LIMIT_ENABLED: Enable rate limiting (default: true)
-        RATE_LIMIT_PER_MINUTE: Requests per minute per IP (default: 10)
+        RATE_LIMIT_PER_MINUTE: Requests per minute per IP (default: 200)
         ENABLE_SECURITY_HEADERS: Enable security headers middleware (default: true)
         CACHE_ENABLED: Enable response caching (default: true)
         CACHE_TTL: Cache TTL in seconds (default: 3600)
@@ -66,7 +66,7 @@ class Settings(BaseSettings):
 
     # Rate limiting
     rate_limit_enabled: bool = True
-    rate_limit_per_minute: int = 50
+    rate_limit_per_minute: int = 200
 
     # Security headers middleware
     enable_security_headers: bool = True
@@ -84,6 +84,44 @@ class Settings(BaseSettings):
 
     # SQLite database file path (relative to app directory or absolute)
     database_path: str = "database.db"
+
+    # ========== Batch Processing Settings ==========
+
+    # Maximum concurrent extractions for batch requests (controls parallelism)
+    batch_concurrency: int = 5  # Max 5 concurrent extractions to avoid overwhelming YouTube
+
+    # ========== Retry Settings ==========
+
+    # Number of retry attempts for failed operations
+    retry_attempts: int = 3
+
+    # Base backoff time in seconds for retries (exponential backoff)
+    retry_backoff_base: float = 1.0
+
+    # ========== HTTP Client Settings ==========
+
+    # HTTP connection pool size
+    http_pool_size: int = 10
+
+    # ========== Cache Settings (Additional) ==========
+
+    # Background cleanup poll interval in seconds
+    cache_cleanup_interval: int = 60
+
+    # ========== Compression Settings ==========
+
+    # Enable gzip compression for responses
+    enable_gzip: bool = True
+
+    # ========== Database Settings (Additional) ==========
+
+    # SQLite connection pool size
+    sqlite_pool_size: int = 5
+
+    # ========== Redis Settings (Additional) ==========
+
+    # Redis connection pool size
+    redis_pool_size: int = 20
 
     model_config = SettingsConfigDict(
         env_prefix="YTDLP_",

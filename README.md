@@ -59,7 +59,7 @@ Configuration is done via environment variables. See `.env.example` for all opti
 | `CACHE_TTL` | 3600 | Cache TTL in seconds |
 | `CACHE_MAXSIZE` | 1000 | Maximum cache entries |
 | `RATE_LIMIT_ENABLED` | true | Enable rate limiting |
-| `RATE_LIMIT_PER_MINUTE` | 10 | Requests per minute per IP |
+| `RATE_LIMIT_PER_MINUTE` | 200 | Requests per minute per IP |
 | `ENABLE_SECURITY_HEADERS` | true | Enable security headers |
 
 ## API Reference
@@ -173,7 +173,7 @@ GET /health
   "timestamp": 1737624000.0,
   "uptime_seconds": 123.45,
   "cache": {"size": 10, "hits": 50, "misses": 20, "hit_rate": 0.714},
-  "rate_limiting": {"enabled": true, "per_minute": 10}
+  "rate_limiting": {"enabled": true, "per_minute": 200}
 }
 ```
 
@@ -197,7 +197,7 @@ docker build -t ytdlp-microservice .
 # Run container
 docker run -p 8000:8000 \
   -e CACHE_ENABLED=true \
-  -e RATE_LIMIT_PER_MINUTE=20 \
+  -e RATE_LIMIT_PER_MINUTE=200 \
   ytdlp-microservice
 ```
 

@@ -16,7 +16,7 @@ from collections import defaultdict
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from enum import Enum
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Awaitable, Callable, cast
 
 import structlog
 import yt_dlp
@@ -26,6 +26,8 @@ from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
+from fastapi.middleware.gzip import GZipMiddleware
+from starlette.concurrency import run_in_threadpool
 from starlette.middleware.base import BaseHTTPMiddleware
 from structlog.contextvars import bind_contextvars, clear_contextvars
 
@@ -33,10 +35,11 @@ if TYPE_CHECKING:
     from app.service import VideoMetadata
 
 # Local imports
+from app import __version__
 from app.cache import CacheProtocol, RedisCache, SubtitleCache
 from app.config import settings
 from app.database import db_engine, db_lifecycle
-from app.service import SubtitleEntry, get_extractor
+from app.service import SubtitleEntry, get_extractor, subtitle_to_srt
 from app.utils import is_valid_youtube_url
 
 # Configure logging with request ID context
@@ -300,6 +303,9 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Add GZip middleware for response compression
+app.add_middleware(GZipMiddleware, minimum_size=1000)
+
 
 # ============================================================================
 # Middleware Configuration
@@ -309,7 +315,7 @@ app = FastAPI(
 class RequestIdMiddleware(BaseHTTPMiddleware):
     """Middleware to add request ID for tracing."""
 
-    async def dispatch(self, request: Request, call_next):
+    async def dispatch(self, request: Request, call_next: "Callable[[Request], Awaitable[Response]]") -> Response:
         """Process request and add request ID."""
         # Generate or extract request ID
         request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
@@ -689,40 +695,9 @@ async def get_subtitles(
             detail="Invalid YouTube URL. Expected format: https://www.youtube.com/watch?v=VIDEO_ID",
         )
 
-    # Check cache if enabled - try database first, then in-memory
+    # Check cache if enabled - try L1 in-memory first, then L2 database
     if settings.cache_enabled:
-        # Check database cache first (persistent across restarts)
-        db_entry = await db_engine.get_cached_subtitle(video_url, lang, format.value)
-        if db_entry is not None:
-            logger.info(f"DB cache hit for {sanitize_for_log(video_url)}")
-            cached_data = db_entry.subtitle_data
-            if format == OutputFormat.vtt:
-                return PlainTextResponse(
-                    content=cached_data,
-                    headers={
-                        "Content-Type": "text/vtt; charset=utf-8",
-                        "X-Video-ID": db_entry.video_id,
-                        "X-Cache": "HIT",
-                    },
-                )
-            elif format == OutputFormat.srt:
-                # SRT format caches as {"video_id": ..., "srt": "..."}
-                srt_data = json.loads(cached_data)
-                return PlainTextResponse(
-                    content=srt_data["srt"],
-                    headers={
-                        "Content-Type": "text/plain; charset=utf-8",
-                        "X-Video-ID": srt_data.get("video_id", db_entry.video_id),
-                        "X-Cache": "HIT",
-                        "Content-Disposition": "attachment; filename=subtitles.srt",
-                    },
-                )
-            elif format == OutputFormat.text:
-                return SubtitleTextResponse.model_validate_json(cached_data)
-            else:
-                return SubtitleResponse.model_validate_json(cached_data)
-
-        # Check in-memory cache
+        # Check in-memory cache first (fastest)
         cached_data = await cache.get(video_url, lang, format.value)
         if cached_data is not None:
             logger.info(f"Memory cache hit for {sanitize_for_log(video_url)}")
@@ -753,14 +728,43 @@ async def get_subtitles(
             else:
                 return SubtitleResponse(**cached_data)
 
+        # Check database cache (persistent across restarts)
+        db_entry = await db_engine.get_cached_subtitle(video_url, lang, format.value)
+        if db_entry is not None:
+            logger.info(f"DB cache hit for {sanitize_for_log(video_url)}")
+            cached_data = db_entry.subtitle_data
+            if format == OutputFormat.vtt:
+                return PlainTextResponse(
+                    content=cached_data,
+                    headers={
+                        "Content-Type": "text/vtt; charset=utf-8",
+                        "X-Video-ID": db_entry.video_id,
+                        "X-Cache": "HIT",
+                    },
+                )
+            elif format == OutputFormat.srt:
+                # SRT format caches as {"video_id": ..., "srt": "..."}
+                srt_data = json.loads(cached_data)
+                return PlainTextResponse(
+                    content=srt_data["srt"],
+                    headers={
+                        "Content-Type": "text/plain; charset=utf-8",
+                        "X-Video-ID": srt_data.get("video_id", db_entry.video_id),
+                        "X-Cache": "HIT",
+                        "Content-Disposition": "attachment; filename=subtitles.srt",
+                    },
+                )
+            elif format == OutputFormat.text:
+                return SubtitleTextResponse.model_validate_json(cached_data)
+            else:
+                return SubtitleResponse.model_validate_json(cached_data)
+
     # Get extractor and run in thread pool (yt-dlp is blocking)
     extractor = get_extractor()
 
     try:
         # Use run_in_threadpool to avoid blocking the event loop
         # yt-dlp operations are synchronous and CPU-intensive
-        from starlette.concurrency import run_in_threadpool
-
         video_id, subtitle_data, metadata = await run_in_threadpool(
             extractor.extract_subtitles, video_url, lang, format.value
         )
@@ -823,8 +827,6 @@ async def get_subtitles(
             return text_response
         elif format == OutputFormat.srt:
             # Convert subtitles to SRT format
-            from app.service import subtitle_to_srt
-
             srt_content = subtitle_to_srt(cast(list[SubtitleEntry], subtitle_data))
             srt_response = PlainTextResponse(
                 content=srt_content,
@@ -922,7 +924,6 @@ async def list_languages(
 
     # Get languages
     extractor = get_extractor()
-    from starlette.concurrency import run_in_threadpool
 
     try:
         video_id, languages = await run_in_threadpool(
@@ -955,7 +956,7 @@ async def batch_extract_subtitles(
 
     **Limits:**
     - Maximum 10 videos per batch
-    - 30 requests per minute per IP (higher than single endpoint)
+    - 600 requests per minute per IP (3x the standard rate limit)
 
     **Example:**
     ```bash
@@ -975,60 +976,53 @@ async def batch_extract_subtitles(
                 detail=f"Rate limit exceeded. Maximum {batch_limit} requests per minute.",
             )
 
-    results = []
     extractor = get_extractor()
 
-    for video_req in batch.videos:
+    # Use semaphore to limit concurrent extractions (avoid overwhelming YouTube)
+    semaphore = asyncio.Semaphore(settings.batch_concurrency)
+
+    async def process_one_video(video_req: BatchVideoRequest) -> BatchResponseItem:
+        """Process a single video with concurrency control and error handling."""
         video_url = video_req.video_url
         lang = video_req.lang
         format = video_req.format
 
         try:
             if not is_valid_youtube_url(video_url):
-                results.append(
-                    BatchResponseItem(
-                        video_url=video_url, success=False, error="Invalid YouTube URL"
-                    )
+                return BatchResponseItem(
+                    video_url=video_url, success=False, error="Invalid YouTube URL"
                 )
-                continue
 
-            # Check cache - try database first, then in-memory
+            # Check cache - try L1 in-memory first, then L2 database (no semaphore needed for cache)
             if settings.cache_enabled:
-                # Check database cache
+                # Check in-memory cache first (fastest)
+                cached = await cache.get(video_url, lang, format)
+                if cached is not None:
+                    return BatchResponseItem(
+                        video_url=video_url,
+                        success=True,
+                        video_id=cached.get("video_id"),
+                        data=cached,
+                    )
+
+                # Check database cache (persistent across restarts)
                 db_entry = await db_engine.get_cached_subtitle(video_url, lang, format)
                 if db_entry is not None:
                     cached = db_entry.subtitle_data
                     # Parse from JSON to dict
                     cached_dict = json.loads(cached)
-                    results.append(
-                        BatchResponseItem(
-                            video_url=video_url,
-                            success=True,
-                            video_id=db_entry.video_id,
-                            data=cached_dict,
-                        )
+                    return BatchResponseItem(
+                        video_url=video_url,
+                        success=True,
+                        video_id=db_entry.video_id,
+                        data=cached_dict,
                     )
-                    continue
 
-                # Check in-memory cache
-                cached = await cache.get(video_url, lang, format)
-                if cached is not None:
-                    results.append(
-                        BatchResponseItem(
-                            video_url=video_url,
-                            success=True,
-                            video_id=cached.get("video_id"),
-                            data=cached,
-                        )
-                    )
-                    continue
-
-            # Extract subtitles
-            from starlette.concurrency import run_in_threadpool
-
-            video_id, subtitle_data, metadata = await run_in_threadpool(
-                extractor.extract_subtitles, video_url, lang, format
-            )
+            # Acquire semaphore for actual extraction (limited concurrency)
+            async with semaphore:
+                video_id, subtitle_data, metadata = await run_in_threadpool(
+                    extractor.extract_subtitles, video_url, lang, format
+                )
 
             # Build metadata dict using helper
             metadata_dict = metadata_to_response_dict(metadata)
@@ -1055,8 +1049,6 @@ async def batch_extract_subtitles(
                     "metadata": metadata_dict,
                 }
             elif format == "srt":
-                from app.service import subtitle_to_srt
-
                 srt_content = subtitle_to_srt(subtitle_data)
                 data = {"video_id": video_id, "srt": srt_content}
             else:  # vtt
@@ -1071,43 +1063,38 @@ async def batch_extract_subtitles(
                     video_url, video_id, lang, format, json.dumps(data), ttl_hours=ttl_hours
                 )
 
-            results.append(
-                BatchResponseItem(
-                    video_url=video_url, success=True, video_id=video_id, data=data
-                )
+            return BatchResponseItem(
+                video_url=video_url, success=True, video_id=video_id, data=data
             )
 
         except yt_dlp.utils.DownloadError as e:
             # yt-dlp specific download errors (e.g., 429 rate limiting, video not found)
             logger.warning(f"Download error for {video_url}: {e}")
-            results.append(
-                BatchResponseItem(
-                    video_url=video_url, success=False, error=f"Download failed: {str(e)[:200]}"
-                )
+            return BatchResponseItem(
+                video_url=video_url, success=False, error=f"Download failed: {str(e)[:200]}"
             )
         except ValueError as e:
             # Validation errors (e.g., invalid URL, no subtitles found)
             logger.warning(f"Validation error for {video_url}: {e}")
-            results.append(
-                BatchResponseItem(
-                    video_url=video_url, success=False, error=f"Validation error: {str(e)[:200]}"
-                )
+            return BatchResponseItem(
+                video_url=video_url, success=False, error=f"Validation error: {str(e)[:200]}"
             )
         except Exception as e:
             logger.exception(f"Unexpected error during batch extraction for {video_url}: {e}")
-            results.append(
-                BatchResponseItem(
-                    video_url=video_url, success=False, error=f"Unexpected error: {str(e)[:200]}"
-                )
+            return BatchResponseItem(
+                video_url=video_url, success=False, error=f"Unexpected error: {str(e)[:200]}"
             )
 
-    return results
+    # Process all videos concurrently with controlled concurrency
+    tasks = [process_one_video(video_req) for video_req in batch.videos]
+    results = await asyncio.gather(*tasks)
+
+    return list(results)
 
 
 @app.get("/", summary="Simple health check")
 async def root() -> dict[str, str]:
     """Simple health check endpoint."""
-    from app import __version__
     return {"status": "healthy", "service": "ytdlp-microservice", "version": __version__}
 
 
@@ -1118,8 +1105,6 @@ async def health() -> HealthResponse:
 
     Returns service status, uptime, cache statistics, and database status.
     """
-    from app import __version__
-
     cache_stats = await cache.get_stats() if settings.cache_enabled else {"enabled": False}
     db_status = await db_engine.health_check()
 

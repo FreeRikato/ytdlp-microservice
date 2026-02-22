@@ -30,7 +30,7 @@ services:
 
       # Rate Limiting
       - RATE_LIMIT_ENABLED=true
-      - RATE_LIMIT_PER_MINUTE=10
+      - RATE_LIMIT_PER_MINUTE=200
 
       # Security
       - ENABLE_SECURITY_HEADERS=true

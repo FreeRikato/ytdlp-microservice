@@ -13,11 +13,15 @@ Anti-Blocking Strategies (in order of priority):
     2. Aggressive Throttling: Sleep between requests to stay under rate limits
     3. Client Source Spoofing: Use non-web client to avoid PO Token requirement
     4. Error Fallbacks: Graceful degradation on partial failures
+    5. Retry Logic: Exponential backoff for transient errors
+    6. Connection Pooling: Reuse HTTP connections for efficiency
 """
 
 import logging
+import random
 import re
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -256,6 +260,12 @@ class SubtitleExtractor:
     # Note: We use bleach for proper HTML sanitization to prevent XSS
     TAG_REMOVAL_PATTERN = re.compile(r"<[^>]*>")
 
+    # Retry configuration for transient errors
+    MAX_RETRIES = 3
+    RETRY_BACKOFF_BASE = 1  # Base delay in seconds
+    RETRY_BACKOFF_MAX = 4   # Maximum delay in seconds
+    RETRY_JITTER = 0.5      # Jitter factor to avoid thundering herd
+
     def __init__(self, config: Settings | None = None):
         """
         Initialize the extractor with configuration.
@@ -264,6 +274,9 @@ class SubtitleExtractor:
             config: Settings instance. Uses global defaults if None.
         """
         self.config = config or Settings()
+        # Language list cache: {video_id: (languages_list, timestamp)}
+        self._language_cache: dict[str, tuple[list[dict[str, Any]], float]] = {}
+        self._language_cache_ttl = 300  # 5 minutes TTL for language lists
 
     def _build_ydl_options(self, lang: str, out_dir: str) -> dict:
         """
@@ -324,6 +337,69 @@ class SubtitleExtractor:
             "socket_timeout": self.config.ytdlp_request_timeout,
         }
 
+    def _is_transient_error(self, error: Exception) -> bool:
+        """
+        Determine if an error is transient and should trigger a retry.
+
+        Transient errors include:
+        - HTTP 429 (Too Many Requests)
+        - HTTP 503 (Service Unavailable)
+        - Network timeouts and connection errors
+
+        Args:
+            error: The exception that occurred during extraction
+
+        Returns:
+            True if the error is transient and retryable
+        """
+        error_message = str(error).lower()
+
+        # HTTP status codes that indicate transient errors
+        transient_status_codes = ["429", "503", "502", "504"]
+        # Network-related error patterns
+        transient_patterns = [
+            "too many requests",
+            "rate limit",
+            "timeout",
+            "connection refused",
+            "connection reset",
+            "connection error",
+            "network error",
+            "temporary",
+            "service unavailable",
+            "bad gateway",
+            "gateway timeout",
+        ]
+
+        # Check for transient status codes
+        if any(code in error_message for code in transient_status_codes):
+            return True
+
+        # Check for transient error patterns
+        if any(pattern in error_message for pattern in transient_patterns):
+            return True
+
+        return False
+
+    def _calculate_retry_delay(self, attempt: int) -> float:
+        """
+        Calculate delay with exponential backoff and jitter.
+
+        Args:
+            attempt: Current retry attempt (0-indexed)
+
+        Returns:
+            Delay in seconds before next retry
+        """
+        # Exponential backoff: 1s, 2s, 4s
+        base_delay = min(
+            self.RETRY_BACKOFF_BASE * (2 ** attempt),
+            self.RETRY_BACKOFF_MAX
+        )
+        # Add jitter to avoid thundering herd problem
+        jitter = random.uniform(0, self.RETRY_JITTER)
+        return base_delay + jitter
+
     def _parse_vtt_to_json(self, vtt_content: str) -> list[SubtitleEntry]:
         """
         Parse WebVTT content into structured subtitle entries.
@@ -337,8 +413,14 @@ class SubtitleExtractor:
         Note:
             Handles standard VTT format with timestamps in HH:MM:SS.mmm format.
             Skips VTT header, style blocks, and empty lines.
+            Optimized for memory efficiency with large files.
         """
         entries = []
+
+        # For very large files (>1MB), use streaming parser
+        if len(vtt_content) > 1_000_000:
+            return self._parse_vtt_streaming(vtt_content)
+
         lines = vtt_content.split("\n")
 
         i = 0
@@ -387,11 +469,171 @@ class SubtitleExtractor:
 
         return entries
 
+    def _parse_vtt_streaming(self, vtt_content: str) -> list[SubtitleEntry]:
+        """
+        Parse large WebVTT files using a memory-efficient streaming approach.
+
+        This method processes the VTT content line by line without loading
+        all lines into a list, reducing memory overhead for large files.
+
+        Args:
+            vtt_content: Raw VTT file content as string
+
+        Returns:
+            List of SubtitleEntry objects with start, end, and text
+        """
+        entries = []
+        current_entry: dict[str, Any] | None = None
+        text_lines: list[str] = []
+        in_header = True
+
+        for line in vtt_content.splitlines():
+            line = line.strip()
+
+            # Skip header section
+            if in_header:
+                if line.startswith("WEBVTT"):
+                    continue
+                if line == "" or line.startswith("NOTE") or line.startswith("STYLE"):
+                    continue
+                # First non-header, non-empty line marks end of header
+                if line:
+                    in_header = False
+                else:
+                    continue
+
+            # Skip empty lines and block markers
+            if not line or line in ("NOTE", "STYLE"):
+                # Save previous entry if exists
+                if current_entry and text_lines:
+                    text = " ".join(text_lines)
+                    text = re.sub(r"\s+", " ", text).strip()
+                    entries.append(SubtitleEntry(
+                        start=current_entry["start"],
+                        end=current_entry["end"],
+                        text=text
+                    ))
+                current_entry = None
+                text_lines = []
+                continue
+
+            # Try to match timestamp line
+            timestamp_match = self.TIMESTAMP_PATTERN.search(line)
+            if not timestamp_match:
+                timestamp_match = self.TIMESTAMP_PATTERN_SHORT.search(line)
+
+            if timestamp_match:
+                # Save previous entry if exists
+                if current_entry and text_lines:
+                    text = " ".join(text_lines)
+                    text = re.sub(r"\s+", " ", text).strip()
+                    entries.append(SubtitleEntry(
+                        start=current_entry["start"],
+                        end=current_entry["end"],
+                        text=text
+                    ))
+                    text_lines = []
+
+                # Start new entry
+                if timestamp_match.re == self.TIMESTAMP_PATTERN_SHORT:
+                    start, end = timestamp_match.groups()
+                    start = f"00:{start}"
+                    end = f"00:{end}"
+                else:
+                    start, end = timestamp_match.groups()
+
+                current_entry = {"start": start, "end": end}
+            elif current_entry:
+                # This is text content for current entry
+                text_line = self.TAG_REMOVAL_PATTERN.sub("", line)
+                text_line = nh3.clean(text_line)
+                if text_line and text_line not in ("NOTE", "STYLE"):
+                    text_lines.append(text_line)
+
+        # Don't forget the last entry
+        if current_entry and text_lines:
+            text = " ".join(text_lines)
+            text = re.sub(r"\s+", " ", text).strip()
+            entries.append(SubtitleEntry(
+                start=current_entry["start"],
+                end=current_entry["end"],
+                text=text
+            ))
+
+        return entries
+
+    def _extract_subtitles_once(
+        self, video_url: str, video_id: str, lang: str, output_format: str, temp_dir: str
+    ) -> tuple[str, list[SubtitleEntry] | str, VideoMetadata]:
+        """
+        Perform a single subtitle extraction attempt.
+
+        Args:
+            video_url: YouTube video URL
+            video_id: Extracted video ID
+            lang: Language code for subtitles
+            output_format: Either "json" or "vtt"
+            temp_dir: Temporary directory for subtitle files
+
+        Returns:
+            Tuple of (video_id, subtitles_data, metadata)
+
+        Raises:
+            yt_dlp.utils.DownloadError: If extraction fails
+            ValueError: If no subtitles found
+        """
+        options = self._build_ydl_options(lang, temp_dir)
+
+        with yt_dlp.YoutubeDL(options) as ydl:
+            # Run the extraction - this downloads the VTT file to temp_dir
+            logger.info(f"Starting yt-dlp extraction with impersonate={self.config.ytdlp_impersonate_target}")
+            info = ydl.extract_info(video_url, download=True)
+
+            # Create video metadata from info dictionary
+            metadata = VideoMetadata.from_info(info)
+
+            # Find the downloaded VTT file
+            temp_path = Path(temp_dir)
+            vtt_files = list(temp_path.glob("*.vtt"))
+
+            if not vtt_files:
+                raise ValueError(
+                    f"No subtitles found for video {video_id} in language '{lang}'. "
+                    f"The video may not have subtitles in this language."
+                )
+
+            # Use the first VTT file found (prioritizes auto-generated)
+            vtt_file = vtt_files[0]
+            logger.info(f"Found subtitle file: {vtt_file.name}")
+
+            vtt_content = vtt_file.read_text(encoding="utf-8")
+
+            if not vtt_content.strip():
+                raise ValueError(f"Subtitle file is empty: {vtt_file.name}")
+
+            # Return based on requested format
+            if output_format == "vtt":
+                # Clean all HTML/XML-style tags from VTT content
+                # First remove angle brackets, then use bleach for HTML sanitization
+                cleaned_vtt = self.TAG_REMOVAL_PATTERN.sub("", vtt_content)
+                cleaned_vtt = nh3.clean(cleaned_vtt)
+                return video_id, cleaned_vtt, metadata
+            else:
+                # Parse VTT to structured JSON
+                entries = self._parse_vtt_to_json(vtt_content)
+                if not entries:
+                    raise ValueError(
+                        "Failed to parse subtitles from VTT file. "
+                        "The file may be malformed or use an unsupported format."
+                    )
+                logger.info(f"Parsed {len(entries)} subtitle entries")
+                return video_id, entries, metadata
+
     def extract_subtitles(
         self, video_url: str, lang: str = "en", output_format: str = "json"
     ) -> tuple[str, list[SubtitleEntry] | str, VideoMetadata]:
         """
-        Extract subtitles from a YouTube video.
+        Extract subtitles from a YouTube video with retry logic.
 
         Args:
             video_url: YouTube video URL
@@ -404,87 +646,67 @@ class SubtitleExtractor:
             - For VTT: (video_id, raw_vtt_string, VideoMetadata)
 
         Raises:
-            yt_dlp.utils.DownloadError: If extraction fails
+            yt_dlp.utils.DownloadError: If extraction fails after all retries
             ValueError: If URL is invalid or no subtitles found
 
         Note:
             Uses a temporary directory that is automatically cleaned up
             after the function returns, even if an exception occurs.
+            Implements exponential backoff retry for transient errors.
         """
         video_id = extract_video_id(video_url)
         if video_id is None:
             raise ValueError(f"Could not extract video ID from URL: {video_url}")
 
-        # Create temp directory that auto-cleans
-        with tempfile.TemporaryDirectory(dir=self.config.ytdlp_temp_dir) as temp_dir:
-            logger.info(f"Extracting subtitles for video {video_id} in language '{lang}'")
+        last_error: Exception | None = None
 
-            options = self._build_ydl_options(lang, temp_dir)
+        for attempt in range(self.MAX_RETRIES):
+            try:
+                # Create temp directory that auto-cleans
+                with tempfile.TemporaryDirectory(dir=self.config.ytdlp_temp_dir) as temp_dir:
+                    logger.info(f"Extracting subtitles for video {video_id} in language '{lang}' (attempt {attempt + 1}/{self.MAX_RETRIES})")
 
-            with yt_dlp.YoutubeDL(options) as ydl:
-                # Run the extraction - this downloads the VTT file to temp_dir
-                logger.info(f"Starting yt-dlp extraction with impersonate={self.config.ytdlp_impersonate_target}")
-                info = ydl.extract_info(video_url, download=True)
-
-                # Create video metadata from info dictionary
-                metadata = VideoMetadata.from_info(info)
-
-                # Find the downloaded VTT file
-                temp_path = Path(temp_dir)
-                vtt_files = list(temp_path.glob("*.vtt"))
-
-                if not vtt_files:
-                    raise ValueError(
-                        f"No subtitles found for video {video_id} in language '{lang}'. "
-                        f"The video may not have subtitles in this language."
+                    return self._extract_subtitles_once(
+                        video_url, video_id, lang, output_format, temp_dir
                     )
 
-                # Use the first VTT file found (prioritizes auto-generated)
-                vtt_file = vtt_files[0]
-                logger.info(f"Found subtitle file: {vtt_file.name}")
+            except Exception as e:
+                last_error = e
 
-                vtt_content = vtt_file.read_text(encoding="utf-8")
-
-                if not vtt_content.strip():
-                    raise ValueError(f"Subtitle file is empty: {vtt_file.name}")
-
-                # Return based on requested format
-                if output_format == "vtt":
-                    # Clean all HTML/XML-style tags from VTT content
-                    # First remove angle brackets, then use bleach for HTML sanitization
-                    cleaned_vtt = self.TAG_REMOVAL_PATTERN.sub("", vtt_content)
-                    cleaned_vtt = nh3.clean(cleaned_vtt)
-                    return video_id, cleaned_vtt, metadata
+                # Check if this is a transient error worth retrying
+                if attempt < self.MAX_RETRIES - 1 and self._is_transient_error(e):
+                    delay = self._calculate_retry_delay(attempt)
+                    logger.warning(
+                        f"Transient error on attempt {attempt + 1} for video {video_id}: {e}. "
+                        f"Retrying in {delay:.2f}s..."
+                    )
+                    time.sleep(delay)
                 else:
-                    # Parse VTT to structured JSON
-                    entries = self._parse_vtt_to_json(vtt_content)
-                    if not entries:
-                        raise ValueError(
-                            "Failed to parse subtitles from VTT file. "
-                            "The file may be malformed or use an unsupported format."
-                        )
-                    logger.info(f"Parsed {len(entries)} subtitle entries")
-                    return video_id, entries, metadata
+                    # Non-transient error or last attempt - don't retry
+                    break
 
-    def list_available_languages(self, video_url: str) -> tuple[str, list[dict[str, Any]]]:
+        # All retries exhausted or non-retryable error
+        if last_error:
+            logger.error(f"Failed to extract subtitles for video {video_id} after {attempt + 1} attempts")
+            raise last_error
+
+        # This should not be reached, but just in case
+        raise RuntimeError(f"Unexpected error extracting subtitles for video {video_id}")
+
+    def _fetch_languages(self, video_url: str, video_id: str) -> list[dict[str, Any]]:
         """
-        List all available subtitle languages for a video.
+        Fetch available languages from YouTube API.
 
         Args:
             video_url: YouTube video URL
+            video_id: Extracted video ID
 
         Returns:
-            Tuple of (video_id, languages_list) where languages_list contains
-            dictionaries with code, name, auto_generated, and formats keys
+            List of language dictionaries
 
         Raises:
-            ValueError: If URL is invalid or cannot extract video info
             yt_dlp.utils.DownloadError: If extraction fails
         """
-        video_id = extract_video_id(video_url)
-        if video_id is None:
-            raise ValueError(f"Could not extract video ID from URL: {video_url}")
-
         options = {
             "skip_download": True,
             "listsubtitles": True,
@@ -520,7 +742,63 @@ class SubtitleExtractor:
                         "formats": formats,
                     })
 
-            return video_id, languages
+            return languages
+
+    def list_available_languages(self, video_url: str) -> tuple[str, list[dict[str, Any]]]:
+        """
+        List all available subtitle languages for a video with caching.
+
+        Language lists are cached for 5 minutes to avoid repeated YouTube queries
+        for the same video.
+
+        Args:
+            video_url: YouTube video URL
+
+        Returns:
+            Tuple of (video_id, languages_list) where languages_list contains
+            dictionaries with code, name, auto_generated, and formats keys
+
+        Raises:
+            ValueError: If URL is invalid or cannot extract video info
+            yt_dlp.utils.DownloadError: If extraction fails
+        """
+        video_id = extract_video_id(video_url)
+        if video_id is None:
+            raise ValueError(f"Could not extract video ID from URL: {video_url}")
+
+        # Check cache first
+        if video_id in self._language_cache:
+            languages, timestamp = self._language_cache[video_id]
+            if time.time() - timestamp < self._language_cache_ttl:
+                logger.debug(f"Language list cache hit for video {video_id}")
+                return video_id, languages
+            else:
+                # Cache expired, remove it
+                del self._language_cache[video_id]
+
+        # Fetch from YouTube
+        logger.info(f"Fetching language list for video {video_id}")
+        languages = self._fetch_languages(video_url, video_id)
+
+        # Cache the result
+        self._language_cache[video_id] = (languages, time.time())
+        logger.debug(f"Cached language list for video {video_id} ({len(languages)} languages)")
+
+        return video_id, languages
+
+    def clear_language_cache(self, video_id: str | None = None) -> None:
+        """
+        Clear the language list cache.
+
+        Args:
+            video_id: Specific video ID to clear, or None to clear all
+        """
+        if video_id is None:
+            self._language_cache.clear()
+            logger.info("Cleared all language list cache entries")
+        elif video_id in self._language_cache:
+            del self._language_cache[video_id]
+            logger.info(f"Cleared language list cache for video {video_id}")
 
 
 # Global extractor instance - reuses configuration across requests

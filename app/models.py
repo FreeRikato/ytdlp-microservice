@@ -55,7 +55,11 @@ class SubtitleCache(SubtitleCacheBase, table=True):
     """
 
     id: int | None = Field(default=None, primary_key=True, description="Unique cache entry ID")
-    expires_at: datetime | None = Field(default=None, description="Optional expiration time")
+    expires_at: datetime | None = Field(
+        default=None,
+        index=True,
+        description="Optional expiration time",
+    )
 
     __table_args__ = (
         UniqueConstraint("video_url", "language", "output_format", name="uq_subtitle_cache_lookup"),
